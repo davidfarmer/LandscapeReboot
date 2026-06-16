@@ -542,6 +542,7 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
         tol = mpf(10) ** (-(system.accuracy))
     if det_tol is None:             # a genuine solution drives the detectors to ~floor
         det_tol = mpf(10) ** (-(system.accuracy - 1))
+    cond_cap = mpf(10) ** (system.working_precision / 2)   # don't lose > half the digits
     h = mpf(10) ** (-(system.working_precision // 3))
     best = None
     for k in range(k_init, k_max + 1):
@@ -564,13 +565,18 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
             if verbose:
                 print(f"   k={k} primes={primes}: solve stalled {mpmath.nstr(nrm,3)}")
             continue
+        cond = _solve_cond(system, primes, x, solve_idx, h)
+        if cond > cond_cap and best is not None:
+            if verbose:                # this k is rank-deficient -> stop enlarging
+                print(f"   k={k} primes={primes}: cond {mpmath.nstr(cond,2)} > cap, stop")
+            break
         full = residual(system, x, primes=primes)
         det = max(abs(full[i]) for i in det_idx)
         if verbose:
             print(f"   k={k} primes={primes}: ||solve||={mpmath.nstr(nrm,3)}  "
-                  f"||det||={mpmath.nstr(det,3)}")
+                  f"||det||={mpmath.nstr(det,3)}  cond={mpmath.nstr(cond,2)}")
         eps, ap = unpack_unknowns(x, primes)
-        cand_sol = {"primes": primes, "epsilon": eps, "ap": ap,
+        cand_sol = {"primes": primes, "epsilon": eps, "ap": ap, "cond": cond,
                     "solve_res": nrm, "det_res": det, "x": x, "k": k}
         if best is None or det < best["det_res"]:
             best = cand_sol
@@ -633,8 +639,10 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
         D0, D1, D2 = Dvals[0][d], Dvals[1][d], Dvals[2][d]
         lines.append((D0, (D1 - D0) / h, (D2 - D0) / h))
 
-    # pairwise intersection of the detector zero-lines -> cloud
-    cloud = []
+    # pairwise intersection of the detector zero-lines -> cloud.  Record, per point,
+    # the offset |Delta| from P and the inverse-matrix norm ||M^{-1}|| -- both needed
+    # to estimate how much precision the intersection costs.
+    cloud, cloud_info = [], []
     nd = len(lines)
     for i in range(nd):
         for j in range(i + 1, nd):
@@ -642,27 +650,189 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
             D0j, g1j, g2j = lines[j]
             det = g1i * g2j - g2i * g1j
             if abs(det) < mpf(10) ** (-(working_precision - 4)) * (abs(g1i) + abs(g2i) + 1):
-                continue                        # near-parallel -> unstable
+                continue                        # near-parallel -> unstable, skip
             d1 = (-D0i * g2j + g2i * D0j) / det
             d2 = (-g1i * D0j + g1j * D0i) / det
+            Minv_norm = max(abs(g2j) + abs(g2i), abs(g1j) + abs(g1i)) / abs(det)
             cloud.append((point[0] + d1, point[1] + d2))
+            cloud_info.append({"offset": max(abs(d1), abs(d2)), "Minv": Minv_norm})
+
+    # precision lost in recovering the coefficients (solve conditioning at corner 0)
+    cond_solve = sol0.get("cond") or _solve_cond(
+        sys0, sol0["primes"], sol0["x"], _solve_indices(sys0, 2 + 2 * k)[0],
+        mpf(10) ** (-(working_precision // 3)))
     if verbose:
         print(f"   corner detector norms: "
               f"{[mpmath.nstr(max(abs(v) for v in Dvals[i]),2) for i in range(3)]}")
-        print(f"   cloud size = {len(cloud)} (from {nd} detector lines)")
+        print(f"   cloud size = {len(cloud)}, solve cond = {mpmath.nstr(cond_solve,3)}")
     return {"corners": corners, "sols": sols, "lines": lines, "cloud": cloud,
-            "detector_idx": detector_idx, "k": k}
+            "cloud_info": cloud_info, "detector_idx": detector_idx, "k": k,
+            "h": h, "cond_solve": cond_solve, "working_precision": working_precision}
 
 
-def cloud_center_spread(cloud):
-    """Robust centre (coordinate-wise median) and spread (max abs deviation from it)."""
+def _solve_cond(system, primes, x, solve_idx, h):
+    """Condition number of the solve subsystem (d solve-equations / d unknowns) at x;
+    log10 of it is roughly the number of digits lost in recovering the coefficients."""
+    r0 = [residual(system, x, primes=primes)[i] for i in solve_idx]
+    U = len(x)
+    J = [[mpf(0)] * U for _ in range(len(solve_idx))]
+    for j in range(U):
+        xp = x[:]
+        xp[j] = xp[j] + h
+        rp = [residual(system, xp, primes=primes)[i] for i in solve_idx]
+        for i in range(len(solve_idx)):
+            J[i][j] = (rp[i] - r0[i]) / h
+    return _condition_number(J)
+
+
+def estimate_cloud_precision(box_result):
+    """Estimated absolute numerical uncertainty of the cloud points (the precision
+    LOST in the calculation), so the loop can raise the working precision.
+
+    A cloud point p solves M p = -D0 (M = the two detector gradients, D0 the detector
+    values).  Each detector value carries error ~ eps_D = 10^{-wp} * cond_solve (wp
+    round-off amplified by the coefficient solve).  Propagating,
+        |dp| ~ ||M^{-1}|| * eps_D * (1 + |offset|/h),
+    the last factor being the gradient-fit cancellation when the box does not bracket
+    the truth.  Returns the median such |dp| over the cloud."""
+    wp = box_result["working_precision"]
+    cond = box_result["cond_solve"]
+    h = box_result["h"]
+    eps_D = mpf(10) ** (-wp) * cond                 # detector value error (round-off x solve cond)
+    amps = sorted(info["Minv"] * (1 + info["offset"] / h)
+                  for info in box_result["cloud_info"])
+    if not amps:
+        return None
+    # the robust cloud centre is set by the WELL-conditioned line pairs, not the
+    # median (near-parallel pairs throw wild outliers the median ignores); use the
+    # lower-quartile amplification.
+    amp = amps[len(amps) // 4]
+    return eps_D * amp
+
+
+def cloud_center_spread(cloud, frac=mpf("0.67")):
+    """Robust centre (coordinate-wise median) and spread = the radius (per axis) that
+    contains a fraction `frac` of the points (Step 7: "a box containing MOST of the
+    points") -- not the max, which near-parallel detector pairs make outlier-driven."""
     if not cloud:
         return None, None
     xs = sorted(p[0] for p in cloud)
     ys = sorted(p[1] for p in cloud)
     cx, cy = xs[len(xs) // 2], ys[len(ys) // 2]
-    spread = max(max(abs(p[0] - cx) for p in cloud), max(abs(p[1] - cy) for p in cloud))
+    dx = sorted(abs(p[0] - cx) for p in cloud)
+    dy = sorted(abs(p[1] - cy) for p in cloud)
+    idx = min(len(cloud) - 1, int(frac * len(cloud)))
+    spread = max(dx[idx], dy[idx])
     return (cx, cy), spread
+
+
+# ---------------------------------------------------------------------------
+# M5 + M6.  The iterative box search
+# ---------------------------------------------------------------------------
+
+def _average_solution(sols):
+    """Average the corner solutions (Step 8: next guess = average over box points)."""
+    sols = [s for s in sols if s is not None]
+    primes = sols[0]["primes"]
+    n = len(sols)
+    ap = {p: mpmath.fsum(s["ap"][p] for s in sols) / n for p in primes}
+    eps = mpmath.fsum(s["epsilon"] for s in sols) / n
+    return {"primes": primes, "ap": ap, "epsilon": eps}
+
+
+# Accuracy needed to resolve a box of half-width h: the detector lines must agree on
+# the point a good bit finer than the box, or the lambda-cloud never shrinks below it.
+# Empirically (GL(3), box 1e-3) accuracy = -log10(h) + ACC_OVER ~ 8 puts the cloud at
+# ~box/3.  But the detector floor (set by prime truncation in the solve) caps the useful
+# accuracy: beyond ACC_MAX the weight set goes redundant and the solve rank-collapses
+# (cond explodes), so we never ask for more.  See lsearch-lambda2-floor.
+ACC_OVER = mpf(8)
+ACC_MAX = 13
+GUARD_DIGITS = 12               # wp must beat accuracy+log10(cond) by this many digits
+
+
+def _accuracy_for_box(boxsize, floor, ln10):
+    return min(mpf(ACC_MAX), max(floor, -mpmath.log(boxsize) / ln10 + ACC_OVER))
+
+
+def search(landscape, euler, point, boxsize, accuracy, working_precision, target_box,
+           guess=None, eps_guess=None, max_iter=40, wander_factor=8,
+           stall_factor=mpf("0.9"), stall_patience=2, verbose=True):
+    """Iterative search (Steps 1-8): shrink a triangular box toward an L-function,
+    raising the accuracy (to tighten the spectral-parameter cloud) and the working
+    precision (to keep the cloud points trustworthy) as the box shrinks.
+
+    Stops with 'success' if the box reaches target_box, or 'converged' if the box stops
+    shrinking -- the detector floor (prime truncation) has been hit and no more digits
+    are available at this accuracy.  Returns a status dict."""
+    point = (mpf(point[0]), mpf(point[1]))
+    boxsize = mpf(boxsize)
+    target = mpf(target_box)
+    acc_floor = mpf(accuracy)
+    wp = int(working_precision)
+    g, eg = guess, (eps_guess or mpc(1))
+    start = point
+    ln10 = mpmath.log(10)
+    stalls = 0
+    last = None                  # last accepted (center, new_box, wp, cloud_prec, sol)
+
+    for it in range(max_iter):
+        # Couple accuracy to the current box: the detectors must localize the point
+        # well inside the box, otherwise the cloud (and hence the box) stalls.
+        accuracy = _accuracy_for_box(boxsize, acc_floor, ln10)
+        wp = max(wp, int(mpmath.ceil(accuracy)) + 6)
+
+        # Box step with the precision guard.  The numerical error of every cloud point
+        # and its genuine (accuracy-limited) spread are both amplified by the same
+        # near-parallel factor, so the right guard is uniform:  wp >= accuracy +
+        # log10(cond) + GUARD_DIGITS.  Redo at higher wp until it holds.
+        for attempt in range(6):
+            mp.dps = wp
+            bs = box_step(landscape, euler, point, boxsize, int(round(accuracy)), wp,
+                          guess=g, eps_guess=eg, verbose=False)
+            if bs is None or not bs["cloud"]:
+                return {"status": "fail", "reason": "no solution", "iter": it}
+            cond = bs["cond_solve"]
+            need = int(mpmath.ceil(accuracy + mpmath.log(cond) / ln10 + GUARD_DIGITS))
+            if wp >= need:
+                break
+            if verbose:
+                print(f"   (redo: wp {wp} < accuracy+log10(cond)+{GUARD_DIGITS} = {need})")
+            wp = need
+        center, spread = cloud_center_spread(bs["cloud"])
+        cloud_prec = estimate_cloud_precision(bs)
+        new_box = min(spread * mpf("1.2"), boxsize)
+        if verbose:
+            print(f"it {it:2d}: box={mpmath.nstr(boxsize,2)} acc={int(round(accuracy))} wp={wp} "
+                  f"cond={mpmath.nstr(cond,2)} | center=({mpmath.nstr(center[0],16)},"
+                  f"{mpmath.nstr(center[1],16)}) spread={mpmath.nstr(spread,2)} "
+                  f"cloud_prec={mpmath.nstr(cloud_prec,2)}")
+
+        if max(abs(center[0] - start[0]), abs(center[1] - start[1])) > wander_factor * boxsize \
+                and it > 0:
+            return {"status": "fail", "reason": "wandered", "iter": it, "point": center}
+
+        last = {"point": center, "box": new_box, "iter": it,
+                "accuracy": int(round(accuracy)), "wp": wp,
+                "cloud_prec": cloud_prec, "sol": _average_solution(bs["sols"])}
+
+        if new_box <= target:
+            return {"status": "success", **last}
+
+        # Stall detection: the box stopped shrinking meaningfully -> the detector floor
+        # has been reached; report the converged point at the achievable precision.
+        if new_box > stall_factor * boxsize:
+            stalls += 1
+            if stalls >= stall_patience:
+                return {"status": "converged", "reason": "detector floor", **last}
+        else:
+            stalls = 0
+
+        avg = last["sol"]
+        g, eg = avg["ap"], avg["epsilon"]
+        point, boxsize = center, new_box
+    return {"status": "fail", "reason": "max_iter", "iter": max_iter,
+            **(last or {"point": point})}
 
 
 # ---------------------------------------------------------------------------
