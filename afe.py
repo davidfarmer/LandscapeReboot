@@ -709,6 +709,136 @@ def coefficient_relation(s, mu=(), nu=(), N=1, epsilon=1, poles=(), g_m=0, g_alp
                      max_terms, inv_z=False, relation=True)
 
 
+# ---------------------------------------------------------------------------
+#  Shared-grid batch:  many weights at one point, ONE precomputed Gamma grid
+# ---------------------------------------------------------------------------
+#
+# At a fixed point the Gamma-product on the contour does not depend on the weight
+# g -- only the factor g(s +- z) does.  So precompute, once on a common grid,
+#     Gpart_k = [prod_i Gamma(kappa_i(z_k + s_eff) + lambda_i)] (z_k^{-1}?) Q^{z_k},
+# and reuse it for every weight: H_k = Gpart_k * g(s +- z_k).  The costly Gamma
+# evaluations are then done once instead of once per weight -- a big speed-up when
+# generating many equations (the search calls this with a whole weight list).
+
+class _GammaGrid:
+    """Precomputed Gamma part of the kernel on a common contour grid, ready to be
+    multiplied by any weight g."""
+
+    def __init__(self, s, nu0, center, h, K, gsign, Gpart):
+        self.s, self.nu0, self.center, self.h, self.K = s, nu0, center, h, K
+        self.gsign, self.Gpart = gsign, Gpart
+        self._twopi = 2 * mpmath.pi
+
+    def fvals(self, g, M):
+        """[f(s,1), ..., f(s,M)] for weight g, on this shared grid."""
+        s, nu0, center, h, K, gs = self.s, self.nu0, self.center, self.h, self.K, self.gsign
+        H = [self.Gpart[idx] * g(s + gs * mpc(nu0, center + (idx - K) * h))
+             for idx in range(2 * K + 1)]
+        out = []
+        for n in range(1, M + 1):
+            omega = mpmath.log(n)
+            w = mpmath.e ** mpc(0, -h * omega)
+            wk = mpmath.e ** mpc(0, K * h * omega)
+            terms = []
+            for idx in range(2 * K + 1):
+                terms.append(H[idx] * wk)
+                wk *= w
+            pref = mpmath.power(n, -nu0) * mpmath.e ** mpc(0, -center * omega) / self._twopi
+            out.append(pref * h * mpmath.fsum(terms))
+        return out
+
+
+def _gamma_grid(s, gd, which, target_digits, n_max, beta_max, alpha_max,
+                contour_nu=None, inv_z=True):
+    """Build the shared Gamma grid for f1/f2, sized for the most demanding weight
+    (largest |beta| -> finest step; largest Re(alpha) -> widest span)."""
+    s = mpc(s)
+    if which == "f1":
+        s_eff, lam, gsign = s, list(gd.lam), mpf(1)
+    else:
+        s_eff, lam, gsign = 1 - s, [mpmath.conj(l) for l in gd.lam], mpf(-1)
+    bound = _min_contour(s_eff, gd.kappa, lam)
+    nu0 = mpf(contour_nu) if contour_nu is not None else bound + mpf(1) / 2
+    d = nu0 - bound
+    if d <= 0:
+        d = mpf(1) / 2
+    logQ = mpmath.log(gd.Q)
+    L = mpf(target_digits) * mpmath.log(10)
+    rate = mpmath.pi / 2 * mpmath.fsum(gd.kappa)
+    a2 = max(mpf(0), mpf(alpha_max))
+    if a2 > 0:
+        Wtail = (-rate + mpmath.sqrt(rate * rate + 4 * a2 * L)) / (2 * a2)
+    else:
+        Wtail = L / rate
+    Wtail = Wtail * mpf("1.15") + 2
+    centers = [-(mpmath.im(s_eff) + mpmath.im(l) / k) for k, l in zip(gd.kappa, lam)]
+    centers += [-mpmath.im(s), mpmath.im(s)]
+    lo, hi = min(centers) - Wtail, max(centers) + Wtail
+    center, halfspan = (lo + hi) / 2, (hi - lo) / 2
+    if halfspan > mpf(10) ** 4:
+        halfspan = mpf(10) ** 4
+    h_strip = 2 * mpmath.pi * d / L
+    phase_slope = (mpf(beta_max) + 2 * abs(alpha_max) * (abs(s) + nu0 + abs(center) + halfspan)
+                   + mpmath.fsum(gd.kappa))
+    h_freq = mpmath.pi / (mpf("1.3") * (mpmath.log(max(n_max, 2)) + phase_slope))
+    h = min(h_strip, h_freq)
+    K = int(mpmath.ceil(halfspan / h))
+    Gpart = []
+    for k in range(-K, K + 1):
+        z = mpc(nu0, center + k * h)
+        prod = mpc(1)
+        for kk, l in zip(gd.kappa, lam):
+            prod *= mpmath.gamma(kk * (z + s_eff) + l)
+        Gpart.append((prod / z if inv_z else prod) * mpmath.e ** (z * logQ))
+    return _GammaGrid(s, nu0, center, h, K, gsign, Gpart)
+
+
+def coefficient_relation_grid(s, mu, nu, N, epsilon, poles, weights, num_terms,
+                              working_precision, contour_nu=None, target_digits=None):
+    """Batched `coefficient_relation` over a list of weights sharing one Gamma grid.
+
+    `weights` is a list of (m, alpha, beta).  Returns a list of (A, B, pole_term),
+    each the same as coefficient_relation(..., relation=True) would give for that
+    weight (Dirichlet length num_terms), but with the Gamma evaluations done once.
+    """
+    old = mp.dps
+    if working_precision is not None:
+        mp.dps = working_precision
+    try:
+        s = mpc(s)
+        gd = lmfdb_to_rubinstein(mu, nu, N, epsilon)
+        if target_digits is None:
+            target_digits = mp.dps
+        Qs = mpmath.e ** (s * mpmath.log(gd.Q))
+        Q1s = mpmath.e ** ((1 - s) * mpmath.log(gd.Q))
+        gfac = gd.C * Qs * mpmath.fprod([mpmath.gamma(k * s + l)
+                                         for k, l in zip(gd.kappa, gd.lam)])
+        beta_max = max((abs(mpmath.re(mpc(be))) + abs(mpmath.im(mpc(be))))
+                       for (_, _, be) in weights)
+        alpha_max = max(mpmath.re(mpc(al)) for (_, al, _) in weights)
+        M = int(num_terms)
+        grid1 = _gamma_grid(s, gd, "f1", target_digits, M, beta_max, alpha_max,
+                            contour_nu=contour_nu, inv_z=False)
+        grid2 = _gamma_grid(s, gd, "f2", target_digits, M, beta_max, alpha_max,
+                            contour_nu=contour_nu, inv_z=False)
+        prefA = [gd.C * Qs * mpmath.e ** (-s * mpmath.log(n)) for n in range(1, M + 1)]
+        prefB = [-gd.C * gd.omega * Q1s * mpmath.e ** (-(1 - s) * mpmath.log(n))
+                 for n in range(1, M + 1)]
+        results = []
+        for (m, al, be) in weights:
+            g = make_g(m, al, be)
+            D = g(s) * gfac
+            f1v = grid1.fvals(g, M)
+            f2v = grid2.fvals(g, M)
+            A = [prefA[n] * f1v[n] / D for n in range(M)]
+            B = [prefB[n] * f2v[n] / D for n in range(M)]
+            pole = mpmath.fsum([-mpc(rk) * g(mpc(sk)) for (sk, rk) in poles]) if poles else mpc(0)
+            results.append((A, B, pole / D))
+        return results
+    finally:
+        mp.dps = old
+
+
 def afe_substitute(s, coefficients, accuracy: int = 20,
                    working_precision: Optional[int] = None,
                    digits: Optional[int] = None, **afe_kwargs):

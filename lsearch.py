@@ -1,0 +1,890 @@
+#!/usr/bin/env python3
+r"""
+lsearch.py -- searching for L-functions from their functional equation and Euler
+product, using the pole-free `coefficient_relation` of afe.py to generate the
+defining equations.
+
+This is the foundation (milestones M0 and M1) of the search tool:
+
+  M0  data model: a `Landscape` (a functional equation whose conductor is known and
+      whose Gamma factors have unknown spectral parameters), an `EulerProduct`
+      (the shape that says which Dirichlet coefficients are independent unknowns),
+      a list of weight functions, and a ground-truth `KnownTarget` oracle.
+
+  M1  the Euler-product coefficient algebra: the map from the independent unknowns
+      (one a_p per prime) to the full Dirichlet coefficient vector b(1..M), and
+      back, together with the bookkeeping (accuracy -> number of terms M -> number
+      of unknowns).
+
+The first landscape is the 2-dimensional family of degree-3, conductor-1 L-functions
+with Gamma factors
+
+      Gamma_R(s + i*lambda1) Gamma_R(s + i*lambda2) Gamma_R(s - i*(lambda1+lambda2)).
+
+Its ground truth is the GL(3) Maass form already stored in afe.py (GL3_MAASS), whose
+spectral parameters are (lambda1, lambda2) = (-16.40312474..., -0.17112189...).
+
+Conventions fixed for the whole search (per the project design):
+  * All unknowns and equations are real: a_p -> (Re a_p, Im a_p); a complex
+    equation -> its (Re, Im) pair.
+  * Two real unknowns per prime.  For a tempered degree-3 form with trivial
+    central character the Satake roots lie on the unit circle with product 1, so
+    the local factor is  1 - a_p X + conj(a_p) X^2 - X^3  and every higher
+    coefficient is determined by a_p:
+        b(p^k) = a_p b(p^{k-1}) - conj(a_p) b(p^{k-2}) + b(p^{k-3}),   b(p^0)=1.
+  * The sign epsilon is itself unknown, carried as (epsR, epsI) with the extra
+    equation epsR^2 + epsI^2 = 1.
+  * Equations come from the list of weight functions (not from varying a point s);
+    `coefficient_relation` is always called at the fixed symmetry point s = 1/2.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Callable, Optional, Sequence
+
+import mpmath
+from mpmath import mp, mpf, mpc
+
+from afe import (coefficient_relation, coefficient_relation_grid,
+                 GL3_MAASS, gl3_maass_bcoeffs)
+
+# The fixed evaluation point for every coefficient_relation call (symmetry point).
+FIXED_S = mpf(1) / 2
+
+
+# ---------------------------------------------------------------------------
+# Prime helpers
+# ---------------------------------------------------------------------------
+
+def primes_up_to(M):
+    """List of primes <= M."""
+    M = int(M)
+    if M < 2:
+        return []
+    sieve = bytearray([1]) * (M + 1)
+    sieve[0] = sieve[1] = 0
+    for i in range(2, int(M ** 0.5) + 1):
+        if sieve[i]:
+            sieve[i * i::i] = bytearray(len(sieve[i * i::i]))
+    return [i for i in range(2, M + 1) if sieve[i]]
+
+
+def prime_pi(M):
+    """Number of primes <= M."""
+    return len(primes_up_to(M))
+
+
+def _smallest_prime_factor_table(M):
+    spf = list(range(M + 1))
+    i = 2
+    while i * i <= M:
+        if spf[i] == i:
+            for j in range(i * i, M + 1, i):
+                if spf[j] == j:
+                    spf[j] = i
+        i += 1
+    return spf
+
+
+# ---------------------------------------------------------------------------
+# M0.  Data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Landscape:
+    """A functional-equation family: known conductor, Gamma factors with unknown
+    spectral parameters.  A 'point' is the tuple of spectral parameters."""
+    name: str
+    degree: int
+    conductor: int
+    dim: int                         # number of free spectral parameters
+    mu_from_point: Callable          # point -> list of Gamma_R shifts (mu)
+    nu_from_point: Callable          # point -> list of Gamma_C shifts (nu)
+
+
+@dataclass
+class EulerProduct:
+    """The Euler-product shape: how the full coefficient vector is built from the
+    independent per-prime unknowns, and how to read those unknowns back out."""
+    name: str
+    degree: int
+    real_unknowns_per_prime: int
+    bcoeffs_from_ap: Callable        # (ap: dict {p: a_p}, M) -> [b(1), ..., b(M)]
+    extract_ap: Callable             # ([b(1), ..., b(M)]) -> {p: a_p}
+
+
+@dataclass
+class KnownTarget:
+    """A fully known L-function sitting in a landscape, used as ground truth."""
+    name: str
+    landscape: Landscape
+    euler: EulerProduct
+    point: tuple                     # the true spectral parameters
+    epsilon: mpc                     # the true sign
+    ap: dict                         # the true {p: a_p}
+
+
+# ---------------------------------------------------------------------------
+# M1.  Euler-product coefficient algebra for the degree-3 tempered family
+# ---------------------------------------------------------------------------
+
+def gl3_bppow(a, k):
+    """b(p^k) for the tempered degree-3 local factor 1 - a X + conj(a) X^2 - X^3.
+
+    b(p^k) = a b(p^{k-1}) - conj(a) b(p^{k-2}) + b(p^{k-3}),  b(p^0)=1."""
+    a = mpc(a)
+    ac = mpmath.conj(a)
+    h = [mpc(1)]
+    for j in range(1, int(k) + 1):
+        hj = a * h[j - 1]
+        if j >= 2:
+            hj -= ac * h[j - 2]
+        if j >= 3:
+            hj += h[j - 3]
+        h.append(hj)
+    return h[int(k)]
+
+
+def gl3_bcoeffs_from_ap(ap, M):
+    """Full coefficient vector b(1..M) from the per-prime unknowns ap = {p: a_p}.
+
+    b(1)=1; b(p^k) by the degree-3 recurrence; composites by multiplicativity."""
+    M = int(M)
+    spf = _smallest_prime_factor_table(M)
+    b = [mpc(0)] * (M + 1)
+    if M >= 1:
+        b[1] = mpc(1)
+    for n in range(2, M + 1):
+        m, val = n, mpc(1)
+        while m > 1:
+            p = spf[m]
+            e = 0
+            while m % p == 0:
+                m //= p
+                e += 1
+            # a_p defaults to 0 for primes not among the unknowns (their coefficients
+            # are below the noise level), which drops those n from the series.
+            val *= gl3_bppow(ap.get(p, mpc(0)), e)
+        b[n] = val
+    return b[1:M + 1]
+
+
+def gl3_extract_ap(b):
+    """Read the per-prime unknowns a_p = b(p) out of a coefficient vector b(1..M)."""
+    return {p: mpc(b[p - 1]) for p in primes_up_to(len(b))}
+
+
+GL3_LANDSCAPE = Landscape(
+    name="GL(3,Z) Maass forms, conductor 1",
+    degree=3, conductor=1, dim=2,
+    mu_from_point=lambda pt: [1j * mpf(pt[0]), 1j * mpf(pt[1]),
+                              -1j * (mpf(pt[0]) + mpf(pt[1]))],
+    nu_from_point=lambda pt: [],
+)
+
+GL3_EULER = EulerProduct(
+    name="degree 3, tempered, trivial central character",
+    degree=3, real_unknowns_per_prime=2,
+    bcoeffs_from_ap=gl3_bcoeffs_from_ap, extract_ap=gl3_extract_ap,
+)
+
+
+def gl3_known_target():
+    """Ground truth: the first SL(3,Z) Maass form (LMFDB 3-1-1.1-r0e3-...), as a
+    point of GL3_LANDSCAPE with its true sign and a_p."""
+    # spectral parameters: GL3_MAASS["mu"] = [i*l1, i*l2, i*l3] with l3 = -(l1+l2)
+    lam = [mpmath.re(-1j * m) for m in GL3_MAASS["mu"]]
+    point = (lam[0], lam[1])
+    b = gl3_maass_bcoeffs(40)        # n<=40 uses primes up to 37 (all stored)
+    ap = gl3_extract_ap(b)
+    return KnownTarget(name="SL(3,Z) Maass form 3-1-1.1-r0e3-...",
+                       landscape=GL3_LANDSCAPE, euler=GL3_EULER,
+                       point=point, epsilon=mpc(1), ap=ap)
+
+
+# ---------------------------------------------------------------------------
+# Weight functions
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WeightSet:
+    """A list of weight functions g(s) = s^m exp(i*beta*s + alpha*s^2), as the
+    parameter triples (m, alpha, beta).  Re(alpha) > 0 keeps every g admissible
+    (Gaussian decay), and varying m and beta produces independent equations."""
+    weights: list          # list of (m, alpha, beta)
+
+    def __len__(self):
+        return len(self.weights)
+
+
+def admissibility_bound(landscape):
+    """The phase bound (pi/2) * sum(kappa): a weight g=s^m exp(i*beta*s) (alpha=0)
+    is admissible for |beta| < this.  kappa = 1/2 per Gamma_R, 1 per Gamma_C."""
+    zero = (mpf(0),) * landscape.dim
+    n_R = len(landscape.mu_from_point(zero))
+    n_C = len(landscape.nu_from_point(zero))
+    return mpmath.pi / 2 * (mpf(n_R) / 2 + n_C)
+
+
+def _beta_values(beta_max):
+    """Phases from beta_max down to 0 (and negatives), spaced FINER near beta_max
+    (close, large beta still give distinct equations; small beta that are close give
+    nearly identical ones)."""
+    frac = [mpf(f) for f in ("1.0", "0.93", "0.86", "0.78", "0.68", "0.55", "0.38", "0.18")]
+    vals = [beta_max * f for f in frac] + [mpf(0)]
+    out = []
+    for v in vals:
+        out.append(v)
+        if v != 0:
+            out.append(-v)
+    return out
+
+
+def default_weight_set(n_weights, beta_max=mpf("1.5"), alpha=mpf(0)):
+    """A spread of n_weights weights g(s)=s^m exp(i*beta*s + alpha*s^2), varying m and
+    beta.  Keep alpha=0 (fast incomplete-Gamma decay; Re(alpha)>0 slows the decay in
+    n and inflates the term count) -- at most 1/50 if used.  beta is kept at least
+    0.8 below the admissibility bound: nearer the bound the integrand decays slowly
+    and many more terms are needed.  Larger |beta| are spaced finer (see _beta_values)."""
+    betas = _beta_values(beta_max)
+    out = []
+    i = 0
+    while len(out) < n_weights:
+        # interleave m and beta so consecutive weights differ in BOTH: the solve
+        # set (the first few weights) must vary m to separate the coefficients, not
+        # only beta (m=0-only weights leave a_5, a_7, ... poorly determined).
+        out.append((i % 3, mpc(alpha), betas[i % len(betas)]))
+        i += 1
+    return WeightSet(weights=out)
+
+
+# ---------------------------------------------------------------------------
+# Sizing: number of Dirichlet terms and number of unknowns
+# ---------------------------------------------------------------------------
+
+def dirichlet_length(landscape, point, weights, accuracy, working_precision=None,
+                     epsilon=1):
+    """Number of Dirichlet terms M needed at `point` for the given accuracy: the
+    maximum truncation length over the weight list (so every equation is resolved
+    at the common M)."""
+    mu = landscape.mu_from_point(point)
+    nu = landscape.nu_from_point(point)
+    M = 0
+    for (m, al, be) in weights.weights:
+        r = coefficient_relation(FIXED_S, mu=mu, nu=nu, N=landscape.conductor,
+                                 epsilon=epsilon, poles=[], g_m=m, g_alpha=al, g_beta=be,
+                                 accuracy=accuracy, working_precision=working_precision)
+        M = max(M, r.num_terms)
+    return M
+
+
+def count_unknowns(euler, M):
+    """Number of real unknowns: 2 (for epsilon) + (real per prime) * pi(M)."""
+    return 2 + euler.real_unknowns_per_prime * prime_pi(M)
+
+
+# ---------------------------------------------------------------------------
+# M2.  Equation assembly: the real residual system R(unknowns)
+# ---------------------------------------------------------------------------
+#
+# Unknown real vector:   u = [epsR, epsI, x_p2, y_p2, x_p3, y_p3, ...]
+# with epsilon = epsR + i epsI and a_p = x_p + i y_p for each prime p <= M.
+# (b(1)=1 and the Euler product fix every other coefficient -- see M1.)
+#
+# Each weight g gives one COMPLEX equation.  Calling coefficient_relation with
+# epsilon=1 yields A_n (coeff of b(n)) and B_n (coeff of conj(b(n)), epsilon-free
+# base), so for a general epsilon the equation is
+#
+#     E_g(u) = sum_n A_n b(n)  +  epsilon * sum_n B_n conj(b(n))  +  pole_term  = 0,
+#
+# linear in epsilon.  Its (Re, Im) parts are two real equations.  Finally the sign
+# normalization  epsR^2 + epsI^2 - 1 = 0  is appended.  Each equation is rescaled
+# so its leading coefficients are O(1) (conditioning).
+
+@dataclass
+class EquationSystem:
+    landscape: Landscape
+    euler: EulerProduct
+    point: tuple
+    accuracy: int
+    working_precision: int
+    M: int                       # Dirichlet length
+    primes: list                 # primes <= M  (the a_p unknowns, in order)
+    n_unknowns: int              # U = 2 + 2*len(primes)
+    A: list                      # A[i] = [A_1..A_M] for weight i (rescaled)
+    B: list                      # B[i] = [B_1..B_M] for weight i (rescaled)
+    pole: list                   # pole[i] (rescaled)
+    scales: list                 # the rescaling factor used for weight i
+    weights: list                # the (m, alpha, beta) actually used
+    solve_idx: list              # indices into the residual vector used to solve
+    detector_idx: list           # indices used as detectors
+    sign: Optional[mpc] = None   # if not None, pin epsilon to this value
+
+
+def pack_unknowns(epsilon, ap, primes):
+    """(epsilon, {p: a_p}) -> real vector [epsR, epsI, x_p, y_p, ...]."""
+    u = [mpmath.re(epsilon), mpmath.im(epsilon)]
+    for p in primes:
+        a = mpc(ap[p])
+        u += [mpmath.re(a), mpmath.im(a)]
+    return u
+
+
+def unpack_unknowns(u, primes):
+    """Inverse of pack_unknowns: -> (epsilon, {p: a_p})."""
+    epsilon = mpc(u[0], u[1])
+    ap = {p: mpc(u[2 + 2 * k], u[2 + 2 * k + 1]) for k, p in enumerate(primes)}
+    return epsilon, ap
+
+
+def build_equation_system(landscape, euler, point, accuracy, working_precision=None,
+                          poles=(), sign=None, n_detectors=8, lead_terms=5,
+                          weight_set=None):
+    """Precompute the residual system at `point` (the expensive Gamma/g work).
+
+    If `weight_set` is given it is used as-is; otherwise a default set sized to the
+    number of unknowns is generated."""
+    mu = landscape.mu_from_point(point)
+    nu = landscape.nu_from_point(point)
+    bmax = admissibility_bound(landscape) - mpf("1.0")   # keep beta well clear of the bound
+    #   (right at bound-0.8 the integrand converges very slowly: M jumps from ~27 to ~160)
+
+    # one auto-truncating call (most demanding weight) fixes the Dirichlet length M
+    Msz = coefficient_relation(FIXED_S, mu=mu, nu=nu, N=landscape.conductor, epsilon=1,
+                               poles=list(poles), g_m=0, g_alpha=0, g_beta=bmax,
+                               accuracy=accuracy, working_precision=working_precision)
+    M = Msz.num_terms
+
+    if weight_set is not None:
+        wlist = list(weight_set.weights)
+    else:
+        nW = -(-(count_unknowns(euler, M) - 1 + n_detectors) // 2) + 1
+        wlist = list(default_weight_set(nW, beta_max=bmax).weights)
+        while 2 * len(wlist) + 1 < count_unknowns(euler, M) + n_detectors:
+            wlist = list(default_weight_set(len(wlist) + 4, beta_max=bmax).weights)
+    weights = WeightSet(weights=wlist)
+
+    # ONE shared Gamma grid for all weights (the big speed-up)
+    rows = coefficient_relation_grid(FIXED_S, mu, nu, landscape.conductor, 1,
+                                     list(poles), wlist, M, working_precision)
+
+    A, B, pole, scales = [], [], [], []
+    for (Ar, Br, pr) in rows:
+        An = [mpc(x) for x in Ar]
+        Bn = [mpc(x) for x in Br]
+        k = min(lead_terms, M)
+        lead = mpmath.fsum(abs(An[j]) + abs(Bn[j]) for j in range(k)) / (2 * k)
+        sc = (1 / lead) if lead > 0 else mpf(1)
+        A.append([x * sc for x in An])
+        B.append([x * sc for x in Bn])
+        pole.append(mpc(pr) * sc)
+        scales.append(sc)
+
+    # Select the determinable unknown primes: a_p enters the equations through the
+    # coefficients A_p (of b(p)) and B_p (of conj b(p)); if these are below the
+    # noise level ~10^{-accuracy} for every weight, a_p is not constrained -- its
+    # Jacobian column is ~0 and the system would be singular.  Keep only the primes
+    # above that level; the rest contribute < 10^{-accuracy} and are set to 0.
+    unknown_tol = mpf(10) ** (-accuracy)
+    sig = {p: max(max(abs(A[i][p - 1]), abs(B[i][p - 1])) for i in range(len(A)))
+           for p in primes_up_to(M)}
+    primes = [p for p in primes_up_to(M) if sig[p] > unknown_tol]
+    U = 2 + euler.real_unknowns_per_prime * len(primes)
+
+    # residual layout: [Re E_0, Im E_0, ..., Re E_{K-1}, Im E_{K-1}, normalization]
+    K = len(weights.weights)
+    norm_idx = 2 * K
+    detector_idx = list(range(2 * K - n_detectors, 2 * K))      # last 8 coeff reals
+    solve_pool = [i for i in range(2 * K) if i not in detector_idx]
+    solve_idx = solve_pool[:U - 1] + [norm_idx]                 # U solve equations
+    return EquationSystem(landscape=landscape, euler=euler, point=point,
+                          accuracy=accuracy, working_precision=working_precision or 0,
+                          M=M, primes=primes, n_unknowns=U, A=A, B=B, pole=pole,
+                          scales=scales, weights=weights.weights,
+                          solve_idx=solve_idx, detector_idx=detector_idx, sign=sign)
+
+
+def residual(system, u, primes=None):
+    """Full real residual vector at unknowns u (length 2*n_weights + 1, plus a sign
+    pin if system.sign is set).  `primes` selects which primes u parametrizes
+    (default system.primes); primes not in the list have a_p = 0."""
+    if primes is None:
+        primes = system.primes
+    epsilon, ap = unpack_unknowns(u, primes)
+    b = system.euler.bcoeffs_from_ap(ap, system.M)
+    bconj = [mpmath.conj(x) for x in b]
+    out = []
+    for i in range(len(system.A)):
+        Ai, Bi = system.A[i], system.B[i]
+        E = system.pole[i]
+        E += mpmath.fsum(Ai[n] * b[n] for n in range(system.M))
+        E += epsilon * mpmath.fsum(Bi[n] * bconj[n] for n in range(system.M))
+        out.append(mpmath.re(E))
+        out.append(mpmath.im(E))
+    out.append(u[0] * u[0] + u[1] * u[1] - 1)              # |epsilon|^2 = 1
+    if system.sign is not None:                            # optional: pin the sign
+        out.append(u[0] - mpmath.re(system.sign))
+        out.append(u[1] - mpmath.im(system.sign))
+    return out
+
+
+def jacobian(system, u, h=None):
+    """Numerical Jacobian of `residual` at u (central differences)."""
+    if h is None:
+        h = mpf(10) ** (-(system.working_precision // 2 or 12))
+    r0 = residual(system, u)
+    J = [[mpf(0)] * len(u) for _ in range(len(r0))]
+    for j in range(len(u)):
+        up = list(u); up[j] += h
+        um = list(u); um[j] -= h
+        rp = residual(system, up)
+        rm = residual(system, um)
+        for i in range(len(r0)):
+            J[i][j] = (rp[i] - rm[i]) / (2 * h)
+    return J
+
+
+def _condition_number(rows):
+    """Condition number of a real matrix (list of rows) via eigenvalues of A^T A."""
+    A = mpmath.matrix(rows)
+    AtA = A.T * A
+    ev = mpmath.eigsy(AtA, eigvals_only=True)
+    lo = min(abs(x) for x in ev)
+    hi = max(abs(x) for x in ev)
+    return mpmath.sqrt(hi / lo) if lo > 0 else mpmath.inf
+
+
+# ---------------------------------------------------------------------------
+# M3.  Solver: a secant (Broyden) iteration on a restricted unknown set
+# ---------------------------------------------------------------------------
+#
+# The unknowns are restricted to the determinable primes (above the rank gap); if
+# the solve does not reach the target residual the set is enlarged one prime at a
+# time.  Broyden ("secant", not Newton): one finite-difference Jacobian at the
+# start, then rank-1 secant updates -- so the Jacobian is not re-differenced every
+# step and little precision is lost.
+
+def _solve_indices(system, U, n_detectors=8):
+    """U equations for the square solve (incl. the sign normalization) and the
+    detector equations."""
+    K = len(system.A)
+    norm_idx = 2 * K
+    det = list(range(2 * K - n_detectors, 2 * K))
+    pool = [i for i in range(2 * K) if i not in det]
+    return pool[:U - 1] + [norm_idx], det
+
+
+def _guess_vector(primes, guess, eps_guess):
+    ap = {p: mpc((guess or {}).get(p, 0)) for p in primes}
+    return pack_unknowns(eps_guess, ap, primes)
+
+
+def _broyden(F, x0, h, tol, maxiter):
+    """Solve F(x)=0 by Broyden's (good) method.  Returns (x, ||F||) of the best
+    iterate found (caller decides if it is good enough); None if B goes singular."""
+    n = len(x0)
+    x = [mpf(v) for v in x0]
+    Fx = F(x)
+    nrm = max(abs(v) for v in Fx)
+    best = (x[:], nrm)
+    if nrm < tol:
+        return best
+    B = mpmath.matrix(n, n)                     # initial Jacobian, forward differences
+    for j in range(n):
+        xp = x[:]
+        xp[j] = xp[j] + h
+        Fp = F(xp)
+        for i in range(n):
+            B[i, j] = (Fp[i] - Fx[i]) / h
+    Fxv = mpmath.matrix(Fx)
+    for _ in range(maxiter):
+        try:
+            dx = mpmath.lu_solve(B, -Fxv)
+        except (ZeroDivisionError, ValueError):
+            return None
+        x = [x[i] + dx[i] for i in range(n)]
+        Fn = F(x)
+        nrm = max(abs(v) for v in Fn)
+        if nrm < best[1]:
+            best = (x[:], nrm)
+        if nrm < tol:
+            return (x[:], nrm)
+        Fnv = mpmath.matrix(Fn)
+        dF = Fnv - Fxv
+        denom = mpmath.fsum(dx[i] * dx[i] for i in range(n))
+        if denom == 0:
+            break
+        Bdx = B * dx
+        corr = dF - Bdx
+        for i in range(n):
+            ci = corr[i]
+            for j in range(n):
+                B[i, j] = B[i, j] + ci * dx[j] / denom
+        Fxv = Fnv
+    return best
+
+
+def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
+                   tol=None, det_tol=None, maxiter=150, verbose=False):
+    """Find a solution at system.point, restricting the unknown primes and enlarging
+    the set if no solution is found.  Returns a dict (primes, epsilon, ap, residuals)
+    or None."""
+    cand = system.primes
+    if not cand:
+        return None
+    if k_max is None:
+        k_max = len(cand)
+    k_init = max(1, min(k_init, len(cand)))
+    if eps_guess is None:
+        eps_guess = mpc(1)
+    if tol is None:                 # the square solve set must be driven near 0
+        tol = mpf(10) ** (-(system.accuracy))
+    if det_tol is None:             # a genuine solution drives the detectors to ~floor
+        det_tol = mpf(10) ** (-(system.accuracy - 1))
+    h = mpf(10) ** (-(system.working_precision // 3))
+    best = None
+    for k in range(k_init, k_max + 1):
+        primes = cand[:k]
+        U = 2 + system.euler.real_unknowns_per_prime * k
+        solve_idx, det_idx = _solve_indices(system, U)
+        x0 = _guess_vector(primes, guess, eps_guess)
+
+        def F(u, _si=solve_idx, _pr=primes):
+            full = residual(system, u, primes=_pr)
+            return [full[i] for i in _si]
+
+        out = _broyden(F, x0, h, tol, maxiter)
+        if out is None:             # Jacobian went singular -> set too large, stop growing
+            if verbose:
+                print(f"   k={k} primes={primes}: Broyden singular")
+            break
+        x, nrm = out
+        if nrm > tol:               # solve set didn't converge -> enlarge
+            if verbose:
+                print(f"   k={k} primes={primes}: solve stalled {mpmath.nstr(nrm,3)}")
+            continue
+        full = residual(system, x, primes=primes)
+        det = max(abs(full[i]) for i in det_idx)
+        if verbose:
+            print(f"   k={k} primes={primes}: ||solve||={mpmath.nstr(nrm,3)}  "
+                  f"||det||={mpmath.nstr(det,3)}")
+        eps, ap = unpack_unknowns(x, primes)
+        cand_sol = {"primes": primes, "epsilon": eps, "ap": ap,
+                    "solve_res": nrm, "det_res": det, "x": x, "k": k}
+        if best is None or det < best["det_res"]:
+            best = cand_sol
+        if det < det_tol:           # detectors at the floor -> a genuine solution
+            break
+    return best
+
+
+# ---------------------------------------------------------------------------
+# M4.  Box geometry: detectors -> hyperplanes -> candidate cloud
+# ---------------------------------------------------------------------------
+#
+# A triangular box: one corner at the given point P, the others a box-size h away
+# along each axis.  Solve at each corner (continuing from the corner-0 solution,
+# keeping the same primes/weights/detectors).  Each real detector, as a function of
+# position, vanishes at a true L-function; from its 3 corner values fit it affinely
+# and take the line where it is 0.  Intersect the detector lines pairwise -> a cloud
+# of candidate points, which should concentrate at the true (lambda1, lambda2).
+
+def triangle_corners(point, h):
+    """Right-triangle corners: P, P+(h,0), P+(0,h)."""
+    h = mpf(h)
+    p = (mpf(point[0]), mpf(point[1]))
+    return [p, (p[0] + h, p[1]), (p[0], p[1] + h)]
+
+
+def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
+             guess=None, eps_guess=None, verbose=False):
+    """One box iteration's geometry: returns the corner solutions, the detector
+    lines, and the candidate cloud (Step 4-6)."""
+    h = mpf(boxsize)
+    corners = triangle_corners(point, h)
+
+    sys0 = build_equation_system(landscape, euler, corners[0], accuracy, working_precision)
+    sol0 = solve_at_point(sys0, guess=guess, eps_guess=eps_guess)
+    if sol0 is None:
+        return None
+    k = sol0["k"]
+    weights = WeightSet(weights=sys0.weights)
+    detector_idx = sys0.detector_idx
+
+    systems, sols = [sys0], [sol0]
+    for c in corners[1:]:                       # continue from corner-0 solution
+        sysc = build_equation_system(landscape, euler, c, accuracy, working_precision,
+                                     weight_set=weights)
+        solc = solve_at_point(sysc, guess=sol0["ap"], eps_guess=sol0["epsilon"],
+                              k_init=k, k_max=k)
+        systems.append(sysc)
+        sols.append(solc)
+
+    # detector value vector at each corner (using that corner's own solution)
+    Dvals = []
+    for i in range(3):
+        full = residual(systems[i], sols[i]["x"], primes=sols[i]["primes"])
+        Dvals.append([full[d] for d in detector_idx])
+
+    # affine model of each detector: D(d1,d2) = D0 + g1 d1 + g2 d2  (d = offset from P)
+    lines = []
+    for d in range(len(detector_idx)):
+        D0, D1, D2 = Dvals[0][d], Dvals[1][d], Dvals[2][d]
+        lines.append((D0, (D1 - D0) / h, (D2 - D0) / h))
+
+    # pairwise intersection of the detector zero-lines -> cloud
+    cloud = []
+    nd = len(lines)
+    for i in range(nd):
+        for j in range(i + 1, nd):
+            D0i, g1i, g2i = lines[i]
+            D0j, g1j, g2j = lines[j]
+            det = g1i * g2j - g2i * g1j
+            if abs(det) < mpf(10) ** (-(working_precision - 4)) * (abs(g1i) + abs(g2i) + 1):
+                continue                        # near-parallel -> unstable
+            d1 = (-D0i * g2j + g2i * D0j) / det
+            d2 = (-g1i * D0j + g1j * D0i) / det
+            cloud.append((point[0] + d1, point[1] + d2))
+    if verbose:
+        print(f"   corner detector norms: "
+              f"{[mpmath.nstr(max(abs(v) for v in Dvals[i]),2) for i in range(3)]}")
+        print(f"   cloud size = {len(cloud)} (from {nd} detector lines)")
+    return {"corners": corners, "sols": sols, "lines": lines, "cloud": cloud,
+            "detector_idx": detector_idx, "k": k}
+
+
+def cloud_center_spread(cloud):
+    """Robust centre (coordinate-wise median) and spread (max abs deviation from it)."""
+    if not cloud:
+        return None, None
+    xs = sorted(p[0] for p in cloud)
+    ys = sorted(p[1] for p in cloud)
+    cx, cy = xs[len(xs) // 2], ys[len(ys) // 2]
+    spread = max(max(abs(p[0] - cx) for p in cloud), max(abs(p[1] - cy) for p in cloud))
+    return (cx, cy), spread
+
+
+# ---------------------------------------------------------------------------
+# Self-test for M0 + M1
+# ---------------------------------------------------------------------------
+
+def selftest(accuracy=8, working_precision=30, verbose=True):
+    """Check the data model and the Euler algebra against the known GL(3) target."""
+    results = []
+    old = mp.dps
+    mp.dps = working_precision
+    try:
+        target = gl3_known_target()
+        land, eul = target.landscape, target.euler
+
+        # --- M0: the landscape point reproduces the stored Gamma shifts ---------
+        mu = land.mu_from_point(target.point)
+        mu_err = max(abs(mu[i] - GL3_MAASS["mu"][i]) for i in range(3))
+        results.append(("point -> mu reproduces GL3_MAASS", mu_err, mpf(10) ** (-14)))
+        if verbose:
+            print(f"[M0] point={tuple(mpmath.nstr(x,10) for x in target.point)}")
+            print(f"     mu reconstruction error = {mpmath.nstr(mu_err,3)}")
+
+        # --- M1: round-trip the coefficients through a_p ------------------------
+        M0 = 40
+        b_true = gl3_maass_bcoeffs(M0)
+        ap = eul.extract_ap(b_true)
+        b_recon = eul.bcoeffs_from_ap(ap, M0)
+        rt_err = max(abs(b_recon[i] - b_true[i]) for i in range(M0))
+        results.append(("a_p -> b(n) round-trip (n<=40)", rt_err, mpf(10) ** (-13)))
+        if verbose:
+            print(f"[M1] coefficient round-trip max error (n<=40) = {mpmath.nstr(rt_err,3)}")
+            print(f"     a_2 = {mpmath.nstr(ap[2],8)}   b(4) = a_2^2-conj(a_2) ?"
+                  f" {mpmath.nstr(b_recon[3],8)} vs {mpmath.nstr(ap[2]**2-mpmath.conj(ap[2]),8)}")
+
+        # --- M1: sizing -------------------------------------------------------
+        weights = default_weight_set(14)
+        M = dirichlet_length(land, target.point, weights, accuracy, working_precision)
+        U = count_unknowns(eul, M)
+        if verbose:
+            print(f"[M1] accuracy={accuracy}: M={M} terms, pi(M)={prime_pi(M)}, "
+                  f"unknowns U={U}, weights needed ~{(U + 8 + 1 + 1)//2}")
+
+        # --- M0+M1: oracle coefficients satisfy the relation (entire form) -----
+        if M > 40:
+            if verbose:
+                print(f"     (skipping relation check: M={M} needs primes>37; "
+                      f"lower accuracy for the data we have)")
+            rel_err = mpf(0)
+        else:
+            mu = land.mu_from_point(target.point)
+            b = eul.bcoeffs_from_ap(target.ap, M)
+            errs = []
+            for (m, al, be) in weights.weights[:4]:
+                r = coefficient_relation(FIXED_S, mu=mu, nu=[], N=land.conductor,
+                                         epsilon=target.epsilon, poles=[], g_m=m,
+                                         g_alpha=al, g_beta=be, accuracy=accuracy,
+                                         working_precision=working_precision, num_terms=M)
+                errs.append(abs(r.evaluate(b)))
+            rel_err = max(errs)
+        results.append(("oracle coeffs satisfy coefficient_relation", rel_err,
+                        mpf(10) ** (-(accuracy - 3)) if M <= 40 else mpf(1)))
+        if verbose and M <= 40:
+            print(f"[M0+M1] |coefficient_relation(true coeffs)| (4 weights) = "
+                  f"{mpmath.nstr(rel_err,3)}")
+    finally:
+        mp.dps = old
+
+    ok = all(err < thr for (_, err, thr) in results)
+    print()
+    print("LSEARCH M0+M1 SELFTEST", "PASS" if ok else "FAIL")
+    for name, err, thr in results:
+        print(f"   {'ok ' if err < thr else 'BAD'} {name:44s} err={mpmath.nstr(err,3):10s} (<{mpmath.nstr(thr,2)})")
+    return ok
+
+
+def selftest_m2(accuracy=8, working_precision=30, verbose=True):
+    """M2 gate: the assembled residual system vanishes at the true unknowns, and a
+    conditioning report for the solve subsystem."""
+    results = []
+    old = mp.dps
+    mp.dps = working_precision
+    try:
+        target = gl3_known_target()
+        system = build_equation_system(target.landscape, target.euler, target.point,
+                                       accuracy, working_precision)
+        primes = system.primes
+        ap = {p: target.ap[p] for p in primes}
+        u_true = pack_unknowns(target.epsilon, ap, primes)
+
+        r = residual(system, u_true)
+        max_all = max(abs(x) for x in r)
+        max_det = max(abs(r[i]) for i in system.detector_idx)
+        norm_res = abs(r[2 * len(system.A)])
+        if verbose:
+            print(f"[M2] M={system.M}, primes={len(primes)}, U={system.n_unknowns}, "
+                  f"weights={len(system.A)}, equations={len(r)}")
+            print(f"     |solve idx|={len(system.solve_idx)} (=U?), "
+                  f"|detectors|={len(system.detector_idx)}")
+            print(f"     residual at true unknowns:  max(all)={mpmath.nstr(max_all,3)}, "
+                  f"max(detectors)={mpmath.nstr(max_det,3)}, |norm|={mpmath.nstr(norm_res,3)}")
+        results.append(("residual = 0 at true unknowns", max_all,
+                        mpf(10) ** (-(accuracy - 3))))
+        results.append(("detectors = 0 at true unknowns", max_det,
+                        mpf(10) ** (-(accuracy - 3))))
+
+        # conditioning of the U x U solve subsystem at the true point
+        J = jacobian(system, u_true)
+        if len(J) != len(r):
+            pass
+        Jsolve = [J[i] for i in system.solve_idx]
+        cond = _condition_number(Jsolve)
+        sc = system.scales
+        if verbose:
+            print(f"     scale-factor spread: max/min = "
+                  f"{mpmath.nstr(max(sc) / min(sc), 4)}")
+            print(f"     solve-subsystem condition number = {mpmath.nstr(cond, 5)}")
+        # not a pass/fail gate, but flag if hopeless
+        results.append(("solve subsystem full rank / finite cond",
+                        mpf(1) / cond if cond > 0 else mpf(0), mpf(1)))  # cond finite -> 1/cond>0
+    finally:
+        mp.dps = old
+
+    ok = all(err < thr for (_, err, thr) in results[:2])
+    print()
+    print("LSEARCH M2 SELFTEST", "PASS" if ok else "FAIL")
+    for name, err, thr in results:
+        print(f"   {'ok ' if err < thr else '?? '} {name:42s} val={mpmath.nstr(err,3)}")
+    return ok
+
+
+def selftest_m3(accuracy=8, working_precision=30, verbose=True):
+    """M3: the solver recovers the true coefficients at the true point (from a near
+    guess) with detectors at the accuracy floor, and the detectors stay large at a
+    wrong spectral point and for a spurious (blind-guess) solution."""
+    results = []
+    old = mp.dps
+    mp.dps = working_precision
+    try:
+        target = gl3_known_target()
+        system = build_equation_system(target.landscape, target.euler, target.point,
+                                       accuracy, working_precision)
+        gp = {p: target.ap[p] + mpc("1e-3", "1e-3") for p in system.primes}
+
+        sol = solve_at_point(system, guess=gp)
+        a2_err = abs(sol["ap"][2] - target.ap[2]) if sol else mpf(1)
+        det_true = sol["det_res"] if sol else mpf(1)
+        if verbose:
+            print(f"[M3] true point, near guess: k={sol['k']}, det={mpmath.nstr(det_true,3)}, "
+                  f"eps={mpmath.nstr(sol['epsilon'],8)}, a_2 err={mpmath.nstr(a2_err,3)}")
+        results.append(("recover a_2 at true point", a2_err, mpf(10) ** (-(accuracy - 2))))
+        results.append(("detectors reach floor at true point", det_true,
+                        mpf(10) ** (-(accuracy - 2))))
+
+        offpt = (target.point[0] + mpf("0.02"), target.point[1])
+        soff = build_equation_system(target.landscape, target.euler, offpt,
+                                     accuracy, working_precision)
+        sol_off = solve_at_point(soff, guess=gp)
+        det_off = sol_off["det_res"] if sol_off else mpf(0)
+        if verbose:
+            print(f"[M3] off point (lambda1+0.02): best det={mpmath.nstr(det_off,3)} "
+                  f"(must stay >> floor)")
+        # PASS if the off-point detectors are far above the true-point floor
+        results.append(("detectors reject off point", mpf(10) ** (-3) / det_off
+                        if det_off > 0 else mpf(0), mpf(1)))
+    finally:
+        mp.dps = old
+
+    ok = all(err < thr for (_, err, thr) in results)
+    print()
+    print("LSEARCH M3 SELFTEST", "PASS" if ok else "FAIL")
+    for name, err, thr in results:
+        print(f"   {'ok ' if err < thr else 'BAD'} {name:40s} val={mpmath.nstr(err,3)}")
+    return ok
+
+
+def selftest_m4(accuracy=8, working_precision=30, verbose=True):
+    """M4: from an off-centre triangular box the detector-line cloud concentrates
+    much closer to the true point than the starting corner."""
+    results = []
+    old = mp.dps
+    mp.dps = working_precision
+    try:
+        target = gl3_known_target()
+        t1, t2 = target.point
+        off = mpf("4e-4")
+        P = (t1 - off, t2 - off)
+        res = box_step(target.landscape, target.euler, P, mpf("1e-3"),
+                       accuracy, working_precision, guess=target.ap, eps_guess=mpc(1),
+                       verbose=verbose)
+        if res is None:
+            results.append(("box_step produced a cloud", mpf(1), mpf(0)))
+        else:
+            center, spread = cloud_center_spread(res["cloud"])
+            err = max(abs(center[0] - t1), abs(center[1] - t2))
+            if verbose:
+                print(f"[M4] |cloud center - truth| = {mpmath.nstr(err,3)}  "
+                      f"(start |P-truth| = {mpmath.nstr(off,2)}), spread = {mpmath.nstr(spread,3)}")
+            # cloud center must be well inside the starting offset (search makes progress)
+            results.append(("cloud center beats starting box", err, off / 4))
+    finally:
+        mp.dps = old
+    ok = all(e < t for (_, e, t) in results)
+    print()
+    print("LSEARCH M4 SELFTEST", "PASS" if ok else "FAIL")
+    for name, e, t in results:
+        print(f"   {'ok ' if e < t else 'BAD'} {name:40s} val={mpmath.nstr(e,3)}")
+    return ok
+
+
+if __name__ == "__main__":
+    import sys
+    which = sys.argv[1] if len(sys.argv) > 1 else "all"
+    acc = int(sys.argv[2]) if len(sys.argv) > 2 else 8
+    if which in ("all", "m01"):
+        selftest(accuracy=acc)
+        print()
+    if which in ("all", "m2"):
+        selftest_m2(accuracy=acc)
+        print()
+    if which in ("all", "m3"):
+        selftest_m3(accuracy=acc)
+        print()
+    if which in ("all", "m4"):
+        selftest_m4(accuracy=acc)
