@@ -743,16 +743,46 @@ def _average_solution(sols):
 # Accuracy needed to resolve a box of half-width h: the detector lines must agree on
 # the point a good bit finer than the box, or the lambda-cloud never shrinks below it.
 # Empirically (GL(3), box 1e-3) accuracy = -log10(h) + ACC_OVER ~ 8 puts the cloud at
-# ~box/3.  But the detector floor (set by prime truncation in the solve) caps the useful
-# accuracy: beyond ACC_MAX the weight set goes redundant and the solve rank-collapses
-# (cond explodes), so we never ask for more.  See lsearch-lambda2-floor.
+# ~box/3.  The accuracy is capped at what the *target* box needs (ACC_MARGIN digits past
+# -log10(target_box) + ACC_OVER): asking for more is wasted work, and -- with the present
+# weight set -- it also rank-collapses the solve (cond explodes; see lsearch-lambda2-floor).
 ACC_OVER = mpf(8)
-ACC_MAX = 13
+ACC_MARGIN = 2                  # accuracy headroom beyond what the target box needs
 GUARD_DIGITS = 12               # wp must beat accuracy+log10(cond) by this many digits
 
 
-def _accuracy_for_box(boxsize, floor, ln10):
-    return min(mpf(ACC_MAX), max(floor, -mpmath.log(boxsize) / ln10 + ACC_OVER))
+def _acc_max_for_target(target_box, ln10):
+    """Largest accuracy worth using to reach a box of half-width target_box."""
+    return mpmath.ceil(-mpmath.log(target_box) / ln10 + ACC_OVER + ACC_MARGIN)
+
+
+def _accuracy_for_box(boxsize, floor, acc_max, ln10):
+    return min(mpf(acc_max), max(floor, -mpmath.log(boxsize) / ln10 + ACC_OVER))
+
+
+def _report_iteration(it, center, spread, cloud_prec, accuracy, wp, boxsize,
+                      cond, sol, det_res):
+    """Per-iteration progress report while refining a point: the current spectral
+    parameters and how well they are pinned down, the recovered Euler coefficients and
+    the sign, and the accuracy/precision parameters driving the search."""
+    # how many decimal places of lambda are actually determined (by the cloud spread)
+    det_digits = int(max(0, -mpmath.log(spread) / mpmath.log(10))) if spread else 0
+    show = det_digits + 6           # determined digits plus a few to watch them settle
+    print(f"  ---- iteration {it} " + "-" * 40)
+    print(f"  spectral parameters (determined to +- {mpmath.nstr(spread, 2)}):")
+    for i, c in enumerate(center, 1):
+        print(f"      lambda{i} = {mpmath.nstr(c, show)}")
+    print(f"  spectral-parameter precision: determination +- {mpmath.nstr(spread, 2)}"
+          f" ,  numerical {mpmath.nstr(cloud_prec, 2)}")
+    print(f"  accuracy = {int(round(accuracy))} digits   working precision = {wp} digits"
+          f"   box half-width = {mpmath.nstr(boxsize, 2)}")
+    print(f"  sign epsilon = {mpmath.nstr(sol['epsilon'], show)}")
+    print(f"  solve condition = {mpmath.nstr(cond, 3)}"
+          f"   detector residual = {mpmath.nstr(det_res, 2)}"
+          f"   primes used = {len(sol['primes'])}")
+    print(f"  Euler coefficients a_p:")
+    for p in sol["primes"]:
+        print(f"      a_{p:<3d}= {mpmath.nstr(sol['ap'][p], 12)}")
 
 
 def search(landscape, euler, point, boxsize, accuracy, working_precision, target_box,
@@ -764,7 +794,29 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
 
     Stops with 'success' if the box reaches target_box, or 'converged' if the box stops
     shrinking -- the detector floor (prime truncation) has been hit and no more digits
-    are available at this accuracy.  Returns a status dict."""
+    are available at this accuracy.  Returns a status dict.
+
+    Example -- refine a point near the first SL(3,Z) Maass form in this landscape::
+
+        import lsearch as L
+        from mpmath import mpf, mpc
+
+        t = L.gl3_known_target()                 # the GL(3) landscape + Euler product
+        res = L.search(
+            t.landscape, t.euler,
+            point=(mpf('-16.4036'), mpf('-0.1716')),   # starting guess for (lambda1, lambda2)
+            boxsize=mpf('1e-3'),                       # initial box half-width
+            accuracy=8,                                # starting accuracy floor (digits)
+            working_precision=30,                      # starting mpmath precision (digits)
+            target_box=mpf('1e-6'),                    # stop once the box is this small
+            guess=t.ap, eps_guess=mpc(1),              # initial Euler coeffs / sign guess
+        )
+        print(res['status'], res['point'])       # 'converged'/'success' and (lambda1, lambda2)
+
+    A per-iteration progress report (spectral parameters and their precision, Euler
+    coefficients, sign, accuracy, working precision, condition number, ...) is printed
+    when ``verbose=True``.  For a cold search with no coefficient guess, pass
+    ``guess=None`` (the unknowns start at 0)."""
     point = (mpf(point[0]), mpf(point[1]))
     boxsize = mpf(boxsize)
     target = mpf(target_box)
@@ -773,13 +825,14 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
     g, eg = guess, (eps_guess or mpc(1))
     start = point
     ln10 = mpmath.log(10)
+    acc_max = _acc_max_for_target(target, ln10)   # cap accuracy at what the target needs
     stalls = 0
     last = None                  # last accepted (center, new_box, wp, cloud_prec, sol)
 
     for it in range(max_iter):
         # Couple accuracy to the current box: the detectors must localize the point
         # well inside the box, otherwise the cloud (and hence the box) stalls.
-        accuracy = _accuracy_for_box(boxsize, acc_floor, ln10)
+        accuracy = _accuracy_for_box(boxsize, acc_floor, acc_max, ln10)
         wp = max(wp, int(mpmath.ceil(accuracy)) + 6)
 
         # Box step with the precision guard.  The numerical error of every cloud point
@@ -802,11 +855,11 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
         center, spread = cloud_center_spread(bs["cloud"])
         cloud_prec = estimate_cloud_precision(bs)
         new_box = min(spread * mpf("1.2"), boxsize)
+        det_res = max((s["det_res"] for s in bs["sols"] if s), default=mpf(0))
+        sol = _average_solution(bs["sols"])
         if verbose:
-            print(f"it {it:2d}: box={mpmath.nstr(boxsize,2)} acc={int(round(accuracy))} wp={wp} "
-                  f"cond={mpmath.nstr(cond,2)} | center=({mpmath.nstr(center[0],16)},"
-                  f"{mpmath.nstr(center[1],16)}) spread={mpmath.nstr(spread,2)} "
-                  f"cloud_prec={mpmath.nstr(cloud_prec,2)}")
+            _report_iteration(it, center, spread, cloud_prec, accuracy, wp,
+                              boxsize, cond, sol, det_res)
 
         if max(abs(center[0] - start[0]), abs(center[1] - start[1])) > wander_factor * boxsize \
                 and it > 0:
@@ -814,7 +867,7 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
 
         last = {"point": center, "box": new_box, "iter": it,
                 "accuracy": int(round(accuracy)), "wp": wp,
-                "cloud_prec": cloud_prec, "sol": _average_solution(bs["sols"])}
+                "cloud_prec": cloud_prec, "det_res": det_res, "sol": sol}
 
         if new_box <= target:
             return {"status": "success", **last}
