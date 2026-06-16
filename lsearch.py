@@ -241,22 +241,27 @@ def _beta_values(beta_max):
     return out
 
 
-def default_weight_set(n_weights, beta_max=mpf("1.5"), alpha=mpf(0)):
-    """A spread of n_weights weights g(s)=s^m exp(i*beta*s + alpha*s^2), varying m and
-    beta.  Keep alpha=0 (fast incomplete-Gamma decay; Re(alpha)>0 slows the decay in
-    n and inflates the term count) -- at most 1/50 if used.  beta is kept at least
-    0.8 below the admissibility bound: nearer the bound the integrand decays slowly
-    and many more terms are needed.  Larger |beta| are spaced finer (see _beta_values)."""
+def default_weight_set(n_weights, beta_max=mpf("1.5"), alphas=(mpf(0), mpf("0.02")),
+                       m_max=5):
+    """A DIVERSE pool of weights g(s)=s^m exp(i*beta*s + alpha*s^2) spanning a grid in
+    (m, alpha, beta) -- the diversity is what makes the equations independent enough to
+    resolve many Euler coefficients.  The solve then picks a well-conditioned subset
+    (see solve_at_point), so the pool just needs to be diverse, not ordered.
+
+    alpha in {0, <=1/50}: Re(alpha)>0 slows the n-decay and would inflate the term count
+    M, but at the admissibility-limited beta the most demanding weight already fixes M,
+    so a small alpha is essentially free here.  beta is kept >= ~1 below the
+    admissibility bound (nearer the bound the integrand decays slowly and M explodes);
+    larger |beta| are spaced finer (see _beta_values)."""
     betas = _beta_values(beta_max)
-    out = []
-    i = 0
-    while len(out) < n_weights:
-        # interleave m and beta so consecutive weights differ in BOTH: the solve
-        # set (the first few weights) must vary m to separate the coefficients, not
-        # only beta (m=0-only weights leave a_5, a_7, ... poorly determined).
-        out.append((i % 3, mpc(alpha), betas[i % len(betas)]))
-        i += 1
-    return WeightSet(weights=out)
+    alphas = [mpc(a) for a in alphas]
+    grid = [(m, al, b) for m in range(m_max + 1) for al in alphas for b in betas]
+    if n_weights >= len(grid):
+        return WeightSet(weights=grid)
+    # even stride through the grid -> a sample diverse in m, alpha and beta
+    step = mpf(len(grid)) / n_weights
+    idx = sorted(set(int(i * step) for i in range(n_weights)))
+    return WeightSet(weights=[grid[i] for i in idx])
 
 
 # ---------------------------------------------------------------------------
@@ -359,10 +364,11 @@ def build_equation_system(landscape, euler, point, accuracy, working_precision=N
     if weight_set is not None:
         wlist = list(weight_set.weights)
     else:
-        nW = -(-(count_unknowns(euler, M) - 1 + n_detectors) // 2) + 1
+        # Generate a POOL larger than the solve+detector equations need, so the solve
+        # can pick a well-conditioned subset (QR row selection) and reach more primes.
+        need_eqs = count_unknowns(euler, M) + n_detectors
+        nW = max(28, -(-need_eqs // 2) + 8)        # ceil(need/2) + selection headroom
         wlist = list(default_weight_set(nW, beta_max=bmax).weights)
-        while 2 * len(wlist) + 1 < count_unknowns(euler, M) + n_detectors:
-            wlist = list(default_weight_set(len(wlist) + 4, beta_max=bmax).weights)
     weights = WeightSet(weights=wlist)
 
     # ONE shared Gamma grid for all weights (the big speed-up)
@@ -455,6 +461,61 @@ def _condition_number(rows):
     return mpmath.sqrt(hi / lo) if lo > 0 else mpmath.inf
 
 
+def _select_rows(rows, k):
+    """Greedy QR-style row pivoting: pick k rows that span the column space best.  Each
+    step adds the row whose component orthogonal to the rows already chosen is largest;
+    this maximizes the smallest singular value of the chosen submatrix, i.e. picks the
+    most independent (best-conditioned) equations from a redundant pool."""
+    k = min(k, len(rows))
+    chosen, basis, avail = [], [], list(range(len(rows)))
+    for _ in range(k):
+        best, best_norm, best_v = -1, mpf(-1), None
+        for i in avail:
+            v = rows[i][:]
+            for b in basis:                      # project out the chosen directions
+                d = mpmath.fsum(v[t] * b[t] for t in range(len(v)))
+                v = [v[t] - d * b[t] for t in range(len(v))]
+            nv = mpmath.sqrt(mpmath.fsum(x * x for x in v))
+            if nv > best_norm:
+                best, best_norm, best_v = i, nv, v
+        if best < 0 or best_norm == 0:
+            break
+        chosen.append(best)
+        avail.remove(best)
+        basis.append([x / best_norm for x in best_v])
+    return chosen
+
+
+def _equation_jacobian(system, x, primes, n_eq):
+    """Numerical Jacobian (central differences) of the first n_eq residual rows with
+    respect to the unknowns x.  Used to choose a well-conditioned solve/detector subset."""
+    h = mpf(10) ** (-(system.working_precision // 2 or 12))
+    U = len(x)
+    rows = [[mpf(0)] * U for _ in range(n_eq)]
+    for j in range(U):
+        xp = x[:]; xp[j] += h
+        xm = x[:]; xm[j] -= h
+        rp = residual(system, xp, primes=primes)
+        rm = residual(system, xm, primes=primes)
+        for i in range(n_eq):
+            rows[i][j] = (rp[i] - rm[i]) / (2 * h)
+    return rows
+
+
+def _select_from_jacobian(jac_full, K, euler, k, n_detectors):
+    """Choose a well-conditioned square solve set (U-1 equations + the sign
+    normalization) and n_detectors further independent equations for k unknown primes,
+    by QR row pivoting on the columns of the full equation Jacobian belonging to those
+    primes.  Returns (solve_idx, det_idx)."""
+    U = 2 + euler.real_unknowns_per_prime * k
+    cols = [0, 1] + [2 + 2 * j + t for j in range(k) for t in (0, 1)]   # eps + k primes
+    sub = [[row[c] for c in cols] for row in jac_full]
+    sel = _select_rows(sub, (U - 1) + n_detectors)
+    solve_idx = sel[:U - 1] + [2 * K]                      # + the sign normalization
+    det_idx = sel[U - 1:U - 1 + n_detectors]
+    return solve_idx, det_idx
+
+
 # ---------------------------------------------------------------------------
 # M3.  Solver: a secant (Broyden) iteration on a restricted unknown set
 # ---------------------------------------------------------------------------
@@ -464,16 +525,6 @@ def _condition_number(rows):
 # time.  Broyden ("secant", not Newton): one finite-difference Jacobian at the
 # start, then rank-1 secant updates -- so the Jacobian is not re-differenced every
 # step and little precision is lost.
-
-def _solve_indices(system, U, n_detectors=8):
-    """U equations for the square solve (incl. the sign normalization) and the
-    detector equations."""
-    K = len(system.A)
-    norm_idx = 2 * K
-    det = list(range(2 * K - n_detectors, 2 * K))
-    pool = [i for i in range(2 * K) if i not in det]
-    return pool[:U - 1] + [norm_idx], det
-
 
 def _guess_vector(primes, guess, eps_guess):
     ap = {p: mpc((guess or {}).get(p, 0)) for p in primes}
@@ -526,16 +577,21 @@ def _broyden(F, x0, h, tol, maxiter):
 
 
 def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
-                   tol=None, det_tol=None, maxiter=150, verbose=False):
+                   tol=None, det_tol=None, maxiter=150, n_detectors=8,
+                   fixed=None, verbose=False):
     """Find a solution at system.point, restricting the unknown primes and enlarging
-    the set if no solution is found.  Returns a dict (primes, epsilon, ap, residuals)
-    or None."""
+    the set if no solution is found.
+
+    For each prime count the solve equations are chosen by QR row pivoting from the
+    (redundant) weight pool, so a well-conditioned square subset is used instead of an
+    arbitrary one -- this is what lets the solve reach many primes and drive the
+    detector residual to the noise floor.  Pass `fixed=(solve_idx, det_idx, primes)` to
+    reuse a previously chosen equation set (e.g. the same detectors at every box corner).
+
+    Returns a dict (primes, epsilon, ap, residuals, solve_idx, det_idx, ...) or None."""
     cand = system.primes
     if not cand:
         return None
-    if k_max is None:
-        k_max = len(cand)
-    k_init = max(1, min(k_init, len(cand)))
     if eps_guess is None:
         eps_guess = mpc(1)
     if tol is None:                 # the square solve set must be driven near 0
@@ -544,11 +600,27 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
         det_tol = mpf(10) ** (-(system.accuracy - 1))
     cond_cap = mpf(10) ** (system.working_precision / 2)   # don't lose > half the digits
     h = mpf(10) ** (-(system.working_precision // 3))
+
+    K = len(system.A)
+    if fixed is not None:           # reuse a chosen equation set at a fixed prime count
+        solve_idx, det_idx, primes = fixed
+        ks = [len(primes)]
+    else:
+        if k_max is None:
+            k_max = len(cand)
+        k_init = max(1, min(k_init, len(cand)))
+        ks = list(range(k_init, k_max + 1))
+        # one equation Jacobian over ALL candidate primes; per-k selection reuses its
+        # columns (far cheaper than re-differencing for every prime count)
+        xall = _guess_vector(cand, guess, eps_guess)
+        jac_full = _equation_jacobian(system, xall, cand, 2 * K)
+
     best = None
-    for k in range(k_init, k_max + 1):
-        primes = cand[:k]
-        U = 2 + system.euler.real_unknowns_per_prime * k
-        solve_idx, det_idx = _solve_indices(system, U)
+    for k in ks:
+        if fixed is None:
+            primes = cand[:k]
+            solve_idx, det_idx = _select_from_jacobian(jac_full, K, system.euler,
+                                                       k, n_detectors)
         x0 = _guess_vector(primes, guess, eps_guess)
 
         def F(u, _si=solve_idx, _pr=primes):
@@ -571,13 +643,14 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
                 print(f"   k={k} primes={primes}: cond {mpmath.nstr(cond,2)} > cap, stop")
             break
         full = residual(system, x, primes=primes)
-        det = max(abs(full[i]) for i in det_idx)
+        det = max(abs(full[i]) for i in det_idx) if det_idx else mpf(0)
         if verbose:
             print(f"   k={k} primes={primes}: ||solve||={mpmath.nstr(nrm,3)}  "
                   f"||det||={mpmath.nstr(det,3)}  cond={mpmath.nstr(cond,2)}")
         eps, ap = unpack_unknowns(x, primes)
         cand_sol = {"primes": primes, "epsilon": eps, "ap": ap, "cond": cond,
-                    "solve_res": nrm, "det_res": det, "x": x, "k": k}
+                    "solve_res": nrm, "det_res": det, "x": x, "k": k,
+                    "solve_idx": solve_idx, "det_idx": det_idx}
         if best is None or det < best["det_res"]:
             best = cand_sol
         if det < det_tol:           # detectors at the floor -> a genuine solution
@@ -616,14 +689,19 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
         return None
     k = sol0["k"]
     weights = WeightSet(weights=sys0.weights)
-    detector_idx = sys0.detector_idx
+    # the QR-chosen solve/detector equations at corner 0 are reused at every corner, so
+    # the detector lines compare the SAME equations across the box
+    detector_idx = sol0["det_idx"]
+    fixed = (sol0["solve_idx"], sol0["det_idx"], sol0["primes"])
 
     systems, sols = [sys0], [sol0]
     for c in corners[1:]:                       # continue from corner-0 solution
         sysc = build_equation_system(landscape, euler, c, accuracy, working_precision,
                                      weight_set=weights)
         solc = solve_at_point(sysc, guess=sol0["ap"], eps_guess=sol0["epsilon"],
-                              k_init=k, k_max=k)
+                              fixed=fixed)
+        if solc is None:            # a corner solve failed -> cannot form the geometry
+            return None
         systems.append(sysc)
         sols.append(solc)
 
@@ -658,9 +736,7 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
             cloud_info.append({"offset": max(abs(d1), abs(d2)), "Minv": Minv_norm})
 
     # precision lost in recovering the coefficients (solve conditioning at corner 0)
-    cond_solve = sol0.get("cond") or _solve_cond(
-        sys0, sol0["primes"], sol0["x"], _solve_indices(sys0, 2 + 2 * k)[0],
-        mpf(10) ** (-(working_precision // 3)))
+    cond_solve = sol0["cond"]
     if verbose:
         print(f"   corner detector norms: "
               f"{[mpmath.nstr(max(abs(v) for v in Dvals[i]),2) for i in range(3)]}")
@@ -823,7 +899,6 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
     acc_floor = mpf(accuracy)
     wp = int(working_precision)
     g, eg = guess, (eps_guess or mpc(1))
-    start = point
     ln10 = mpmath.log(10)
     acc_max = _acc_max_for_target(target, ln10)   # cap accuracy at what the target needs
     stalls = 0
@@ -861,9 +936,13 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
             _report_iteration(it, center, spread, cloud_prec, accuracy, wp,
                               boxsize, cond, sol, det_res)
 
-        if max(abs(center[0] - start[0]), abs(center[1] - start[1])) > wander_factor * boxsize \
+        # Wander check: the cloud centre should sit within (a few box-widths of) the box
+        # we just searched.  Measure the PER-STEP displacement from this box's centre --
+        # NOT the original start, which stays a fixed offset away while the box shrinks.
+        if max(abs(center[0] - point[0]), abs(center[1] - point[1])) > wander_factor * boxsize \
                 and it > 0:
-            return {"status": "fail", "reason": "wandered", "iter": it, "point": center}
+            return {"status": "fail", "reason": "wandered", "iter": it, "point": center,
+                    "box": new_box}
 
         last = {"point": center, "box": new_box, "iter": it,
                 "accuracy": int(round(accuracy)), "wp": wp,
