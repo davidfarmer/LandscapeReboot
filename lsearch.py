@@ -862,7 +862,7 @@ def _report_iteration(it, center, spread, cloud_prec, accuracy, wp, boxsize,
 
 
 def search(landscape, euler, point, boxsize, accuracy, working_precision, target_box,
-           guess=None, eps_guess=None, max_iter=40, wander_factor=8,
+           guess=None, eps_guess=None, max_iter=40, wander_dist=mpf("0.25"),
            stall_factor=mpf("0.9"), stall_patience=2, verbose=True):
     """Iterative search (Steps 1-8): shrink a triangular box toward an L-function,
     raising the accuracy (to tighten the spectral-parameter cloud) and the working
@@ -899,6 +899,8 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
     acc_floor = mpf(accuracy)
     wp = int(working_precision)
     g, eg = guess, (eps_guess or mpc(1))
+    start = point                                 # the grid point we started from
+    wander_dist = mpf(wander_dist)
     ln10 = mpmath.log(10)
     acc_max = _acc_max_for_target(target, ln10)   # cap accuracy at what the target needs
     stalls = 0
@@ -936,11 +938,11 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
             _report_iteration(it, center, spread, cloud_prec, accuracy, wp,
                               boxsize, cond, sol, det_res)
 
-        # Wander check: the cloud centre should sit within (a few box-widths of) the box
-        # we just searched.  Measure the PER-STEP displacement from this box's centre --
-        # NOT the original start, which stays a fixed offset away while the box shrinks.
-        if max(abs(center[0] - point[0]), abs(center[1] - point[1])) > wander_factor * boxsize \
-                and it > 0:
+        # Wander check: give up if the cloud centre has drifted more than an ABSOLUTE
+        # distance wander_dist from the grid point we started at.  Absolute (not box-
+        # relative) so a search can begin on a grid much coarser than the box and still
+        # follow the detectors to a nearby L-function, abandoning only genuine runaways.
+        if max(abs(center[0] - start[0]), abs(center[1] - start[1])) > wander_dist:
             return {"status": "fail", "reason": "wandered", "iter": it, "point": center,
                     "box": new_box}
 
