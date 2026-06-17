@@ -1,0 +1,79 @@
+
+Symbolically evaluate an L-function with Gamma facors
+  11^{s/2} GammaC(s + 1/2 + 0.8i) GammaC(s + 1/2 - 0.8i)
+and sign=1 at the point 1/2 + i.
+
+python3 afe.py expr --s "0.5+j" --nu "0.5+0.8j,0.5-0.8j" --N 11 --epsilon 1 \
+          --m 0 --alpha 0.0 --beta 0.0 --accuracy 10 --working-precision 25
+
+(Comma lists take NO brackets: --nu "a,b", not "[a,b]".)
+
+-----
+
+Numerically evaluate the Riemann zeta function at s = 2 + 3i.
+zeta has one Gamma_R factor (mu = 0), conductor 1, sign 1, and coefficients
+b(n) = 1.  Crucially its completed Lambda(s) has POLES at s = 1 and s = 0 with
+residues +1 and -1, supplied as --poles "1:1;0:-1" (omitting them gives a wrong
+answer).  The --coeffs list fixes the number of terms (6 suffice here).
+Result matches zeta(2+3i) = 0.79802198514628 - 0.11374430805294 i.
+
+python3 afe.py eval --s "2+3j" --mu "0" --N 1 --epsilon 1 --poles "1:1;0:-1" \
+          --m 0 --alpha 0.0 --beta 0.0 --accuracy 10 --working-precision 25 \
+          --coeffs "1,1,1,1,1,1"
+
+-----
+
+Numerically evaluate the degree-3 test L-function (the first SL(3,Z) Maass form)
+at s = 1/2 + i.  Gamma factors
+  GammaR(s - 16.40312474i) GammaR(s - 0.17112189i) GammaR(s + 16.57424663i),
+conductor 1, sign 1.  All 16 Dirichlet coefficients b(1..16) are given explicitly.
+Expected result:  L(0.5+i) = 0.4978356702126... + 0.2952749765816...i
+
+python3 afe.py eval --s "0.5+j" \
+   --mu "0.0-16.40312474029137j,0.0-0.1711218917283119j,0.0+16.57424663201969j" \
+   --N 1 --epsilon 1 --m 0 --alpha 0.0 --beta 0.0 --accuracy 12 --working-precision 30 \
+   --coeffs "1.0+0.0j,-0.421686487797524-1.067967972969394j,-0.768022166401658+1.313292412672322j,-0.541049609499821-0.1672726457659844j,-0.400489301596597-0.239855175016566j,1.726418805778305+0.2664254112966134j,-0.11706960257264-0.55358783060162j,-0.2688636041570922+0.6483602692310634j,-0.3668567466967345-0.703982955126592j,-0.08727671807790893+0.5288534339548422j,-0.0411980839359+0.100386874626j,0.635215989750916-0.5820872472545092j,-0.309485590964+0.3283925142812j,-0.5418474037714278+0.3584670941296827j,0.6225846425223534-0.3417454700043763j,-0.02267747436547389-0.5469479791562542j"
+
+python3 afe.py expr --s "0.5+j" \
+   --mu "0.0-16.40312474029137j,0.0-0.1711218917283119j,0.0+16.57424663201969j" \
+   --N 1 --epsilon 1 --m 0 --alpha 0.0 --beta 0.0 --accuracy 12 --working-precision 30 
+
+-----
+
+SEARCH for an L-point near a starting spectral point (l1, l2), cold (the Euler
+coefficients are NOT supplied -- they are recovered during the search).  The
+landscape is the degree-3, tempered, conductor-1 GL(3) Maass-form family with
+Gamma factors  GammaR(s + i*l1) GammaR(s + i*l2) GammaR(s - i*(l1+l2)).
+(Each search takes several minutes; smaller --target / higher accuracy is slower.)
+
+Start near the first SL(3,Z) Maass form and converge onto it
+(true point: l1 = -16.40312474, l2 = -0.17112189).
+NOTE: when the point starts with a minus sign, write it as --point=... (with the
+equals sign and no space), or argparse mistakes the value for an option.
+
+python3 lsearch.py search --point=-16.4036,-0.1716 --conductor 1 \
+          --boxsize 1e-3 --accuracy 8 --working-precision 30 \
+          --target 1e-6 --epsilon 1 --max-iter 8
+
+-----
+
+DISCOVER an L-point by cold search from a coarse grid point.  Starting at
+(14.14, 2.4) -- not near any known form -- the detectors pull the search onto a
+genuine GL(3) Maass form at l1 = 14.14163558812745, l2 = 2.380388488812225.
+(A converged box, the detector residual falling as accuracy rises, and the low
+coefficients inside the Satake bound |a_p| <= 3, confirm it is real.)
+
+python3 lsearch.py search --point "14.14,2.4" --conductor 1 \
+          --boxsize 1e-3 --accuracy 8 --working-precision 30 \
+          --target 1e-6 --epsilon 1 --max-iter 8 --wander-dist 0.25
+
+-----
+
+Self-tests (fast validation that the engine and the search machinery are sound):
+
+python3 afe.py selftest --accuracy 20
+python3 lsearch.py m3
+python3 lsearch.py m4
+
+-----
+

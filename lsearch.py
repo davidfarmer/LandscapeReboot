@@ -1320,8 +1320,63 @@ def selftest_m4(accuracy=8, working_precision=30, verbose=True):
     return ok
 
 
+def _search_cli(argv):
+    """Command-line search of the degree-3, tempered, conductor-N GL(3) Maass-form
+    landscape with Gamma factors
+        Gamma_R(s + i*l1) Gamma_R(s + i*l2) Gamma_R(s - i*(l1+l2)),
+    cold-started (Euler coefficients unknown) from a given spectral point."""
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="lsearch.py search",
+        description="Search the degree-3, tempered, conductor-N GL(3) landscape "
+                    "[Gamma_R(s+i*l1) Gamma_R(s+i*l2) Gamma_R(s-i*(l1+l2))] for an "
+                    "L-function near a starting spectral point (coefficients unknown).")
+    p.add_argument("--point", required=True,
+                   help="starting spectral point 'l1,l2', e.g. '14.14,2.4'")
+    p.add_argument("--conductor", type=int, default=1, help="conductor N")
+    p.add_argument("--boxsize", default="1e-3", help="initial box half-width")
+    p.add_argument("--accuracy", type=int, default=8, help="starting accuracy (digits)")
+    p.add_argument("--working-precision", type=int, default=30,
+                   help="starting mpmath precision (digits)")
+    p.add_argument("--target", default="1e-6",
+                   help="stop once the box half-width reaches this")
+    p.add_argument("--max-iter", type=int, default=12)
+    p.add_argument("--epsilon", default="1",
+                   help="sign (root number) guess, e.g. '1' or '0.6+0.8j'")
+    p.add_argument("--wander-dist", default="0.25",
+                   help="abort if the centre drifts this far (absolute) from the start")
+    a = p.parse_args(argv)
+
+    l1, l2 = (mpf(t.strip()) for t in a.point.split(","))
+    mp.dps = a.working_precision
+    land = Landscape(
+        name="GL(3) degree 3, conductor %d" % a.conductor,
+        degree=3, conductor=a.conductor, dim=2,
+        mu_from_point=lambda pt: [1j * mpf(pt[0]), 1j * mpf(pt[1]),
+                                  -1j * (mpf(pt[0]) + mpf(pt[1]))],
+        nu_from_point=lambda pt: [])
+    res = search(land, GL3_EULER, (l1, l2), mpf(a.boxsize), a.accuracy,
+                 a.working_precision, mpf(a.target), guess=None,
+                 eps_guess=mpc(complex(a.epsilon.replace(" ", ""))),
+                 max_iter=a.max_iter, wander_dist=mpf(a.wander_dist), verbose=True)
+    print()
+    print("STATUS:", res["status"], res.get("reason", ""))
+    c = res.get("point")
+    if c is not None:
+        print("point = (%s, %s)" % (mpmath.nstr(c[0], 16), mpmath.nstr(c[1], 16)))
+        print("box   =", mpmath.nstr(res.get("box", 0), 3))
+    sol = res.get("sol")
+    if sol:
+        print("sign epsilon =", mpmath.nstr(sol["epsilon"], 12))
+        for pp in sol["primes"]:
+            print("  a_%-3d = %s" % (pp, mpmath.nstr(sol["ap"][pp], 12)))
+
+
 if __name__ == "__main__":
     import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "search":
+        _search_cli(sys.argv[2:])
+        raise SystemExit(0)
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     acc = int(sys.argv[2]) if len(sys.argv) > 2 else 8
     if which in ("all", "m01"):
