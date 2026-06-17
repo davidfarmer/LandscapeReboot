@@ -691,38 +691,10 @@ def solve_at_point_lsq(system, guess=None, eps_guess=None, k=None, n_eq=None,
     # the unknowns), chosen by QR pivoting; always include the sign normalization
     if n_eq is None:
         n_eq = min(2 * K, 4 * U)
-    x = _guess_vector(primes, guess, eps_guess)
-    jac0 = _equation_jacobian(system, x, primes, 2 * K)
+    x0 = _guess_vector(primes, guess, eps_guess)
+    jac0 = _equation_jacobian(system, x0, primes, 2 * K)
     eq_idx = _select_rows(jac0, n_eq) + [norm_idx]
-    h = mpf(10) ** (-(system.working_precision // 2))
-
-    def Fvec(u):
-        full = residual(system, u, primes=primes)
-        return [full[i] for i in eq_idx]
-
-    nrm = None
-    for _ in range(maxiter):
-        Fx = Fvec(x)
-        nrm = max(abs(v) for v in Fx)
-        if nrm < tol:
-            break
-        J = [[mpf(0)] * U for _ in range(len(eq_idx))]
-        for j in range(U):
-            xp = x[:]; xp[j] += h
-            xm = x[:]; xm[j] -= h
-            rp = Fvec(xp); rm = Fvec(xm)
-            for i in range(len(eq_idx)):
-                J[i][j] = (rp[i] - rm[i]) / (2 * h)
-        Jm = mpmath.matrix(J)
-        Fv = mpmath.matrix(Fx)
-        try:                                    # least-squares step via QR
-            du = mpmath.qr_solve(Jm, -Fv)[0]
-        except Exception:                       # rank-deficient -> damped normal eqs
-            JtJ = Jm.T * Jm
-            for i in range(U):
-                JtJ[i, i] += damping
-            du = mpmath.lu_solve(JtJ, -(Jm.T * Fv))
-        x = [x[i] + du[i] for i in range(U)]
+    x, nrm = _lsq_core(system, primes, eq_idx, x0, tol, maxiter, damping)
 
     eps, ap = unpack_unknowns(x, primes)
     full = residual(system, x, primes=primes)
@@ -732,6 +704,51 @@ def solve_at_point_lsq(system, guess=None, eps_guess=None, k=None, n_eq=None,
               f"all_res={mpmath.nstr(all_res,3)}")
     return {"primes": primes, "epsilon": eps, "ap": ap, "x": x, "k": k,
             "lsq_res": nrm, "all_res": all_res, "n_eq": len(eq_idx)}
+
+
+def _lsq_core(system, primes, fit_idx, x0, tol, maxiter, damping=mpf("1e-30")):
+    """Gauss-Newton least-squares fit of the residual equations indexed by fit_idx,
+    starting from x0.  The equations are nearly linear in the coefficients, so the
+    Jacobian is computed ONCE at x0 and reused (chord / modified Gauss-Newton): each
+    step solves min ||J du + F|| via QR (LM-damped normal equations as a rank-deficient
+    fallback).  Returns (x, ||fit residual||)."""
+    U = len(x0)
+    h = mpf(10) ** (-(system.working_precision // 2))
+    x = list(x0)
+
+    def Fvec(u):
+        full = residual(system, u, primes=primes)
+        return [full[i] for i in fit_idx]
+
+    # one Jacobian at x0, reused for every step
+    J = [[mpf(0)] * U for _ in range(len(fit_idx))]
+    for j in range(U):
+        xp = x[:]; xp[j] += h
+        xm = x[:]; xm[j] -= h
+        rp = Fvec(xp); rm = Fvec(xm)
+        for i in range(len(fit_idx)):
+            J[i][j] = (rp[i] - rm[i]) / (2 * h)
+    Jm = mpmath.matrix(J)
+
+    def step(Fx):
+        Fv = mpmath.matrix(Fx)
+        try:                                    # least-squares step via QR
+            return mpmath.qr_solve(Jm, -Fv)[0]
+        except Exception:                       # rank-deficient -> damped normal eqs
+            JtJ = Jm.T * Jm
+            for i in range(U):
+                JtJ[i, i] += damping
+            return mpmath.lu_solve(JtJ, -(Jm.T * Fv))
+
+    nrm = None
+    for _ in range(maxiter):
+        Fx = Fvec(x)
+        nrm = max(abs(v) for v in Fx)
+        if nrm < tol:
+            break
+        du = step(Fx)
+        x = [x[i] + du[i] for i in range(U)]
+    return x, nrm
 
 
 # ---------------------------------------------------------------------------
@@ -753,9 +770,18 @@ def triangle_corners(point, h):
 
 
 def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
-             guess=None, eps_guess=None, verbose=False):
+             guess=None, eps_guess=None, solver="square", verbose=False):
     """One box iteration's geometry: returns the corner solutions, the detector
-    lines, and the candidate cloud (Step 4-6)."""
+    lines, and the candidate cloud (Step 4-6).
+
+    solver="square" (default) recovers the coefficients at each corner with the square
+    QR-selected solve -- this is what the detector-line geometry wants, because the
+    solve equations are driven exactly to zero so the held-out detectors' zero-lines
+    pass cleanly through the true point.  solver="lsq" instead refines the corner
+    coefficients by least-squares over all non-detector equations; this does NOT reliably
+    improve the lambda-determination (the L2 compromise muddies the held-out detector
+    geometry), so it is not the default.  LSQ's real value is sharper COEFFICIENTS at a
+    known point -- see search(refine_coeffs=...)."""
     h = mpf(boxsize)
     corners = triangle_corners(point, h)
 
@@ -780,6 +806,20 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
             return None
         systems.append(sysc)
         sols.append(solc)
+
+    if solver == "lsq":
+        # refine each corner's coefficients by least-squares over every non-detector
+        # equation (plus the sign normalization), warm-started from the square solve.
+        # The detector equations stay held out, so their zero-lines remain independent.
+        primes = sol0["primes"]
+        K = len(sys0.A)
+        det_set = set(detector_idx)
+        fit_idx = [i for i in range(2 * K) if i not in det_set] + [2 * K]
+        tol = mpf(10) ** (-(sys0.accuracy))
+        for i in range(3):
+            x_ref, _ = _lsq_core(systems[i], primes, fit_idx, sols[i]["x"], tol, 30)
+            eps_r, ap_r = unpack_unknowns(x_ref, primes)
+            sols[i] = {**sols[i], "x": x_ref, "epsilon": eps_r, "ap": ap_r}
 
     # detector value vector at each corner (using that corner's own solution)
     Dvals = []
@@ -937,9 +977,33 @@ def _report_iteration(it, center, spread, cloud_prec, accuracy, wp, boxsize,
         print(f"      a_{p:<3d}= {mpmath.nstr(sol['ap'][p], 12)}")
 
 
+def _finalize_coeffs(result, landscape, euler, refine_coeffs, verbose):
+    """At the converged point, recover the Euler coefficients by least-squares (more
+    equations than unknowns), which is where the LSQ solve genuinely helps: it averages
+    out per-equation noise and lets the high primes absorb their terms, sharpening the
+    low coefficients.  Replaces result['sol'] and records the global fit residual."""
+    if not refine_coeffs:
+        return result
+    pt = result["point"]
+    acc = result["accuracy"]
+    wp = result["wp"]
+    sol = result.get("sol") or {}
+    mp.dps = wp
+    sysf = build_equation_system(landscape, euler, pt, acc, wp)
+    ls = solve_at_point_lsq(sysf, guess=sol.get("ap"), eps_guess=sol.get("epsilon"))
+    if ls is not None:
+        result["sol"] = {"primes": ls["primes"], "ap": ls["ap"], "epsilon": ls["epsilon"]}
+        result["coeff_fit_res"] = ls["all_res"]
+        if verbose:
+            print(f"  [final coefficients by least-squares: {ls['n_eq']} equations, "
+                  f"global fit residual {mpmath.nstr(ls['all_res'], 2)}]")
+    return result
+
+
 def search(landscape, euler, point, boxsize, accuracy, working_precision, target_box,
            guess=None, eps_guess=None, max_iter=40, wander_dist=mpf("0.25"),
-           stall_factor=mpf("0.9"), stall_patience=2, verbose=True):
+           stall_factor=mpf("0.9"), stall_patience=2, solver="square",
+           refine_coeffs=True, verbose=True):
     """Iterative search (Steps 1-8): shrink a triangular box toward an L-function,
     raising the accuracy (to tighten the spectral-parameter cloud) and the working
     precision (to keep the cloud points trustworthy) as the box shrinks.
@@ -995,7 +1059,7 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
         for attempt in range(6):
             mp.dps = wp
             bs = box_step(landscape, euler, point, boxsize, int(round(accuracy)), wp,
-                          guess=g, eps_guess=eg, verbose=False)
+                          guess=g, eps_guess=eg, solver=solver, verbose=False)
             if bs is None or not bs["cloud"]:
                 return {"status": "fail", "reason": "no solution", "iter": it}
             cond = bs["cond_solve"]
@@ -1027,14 +1091,17 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
                 "cloud_prec": cloud_prec, "det_res": det_res, "sol": sol}
 
         if new_box <= target:
-            return {"status": "success", **last}
+            return _finalize_coeffs({"status": "success", **last},
+                                    landscape, euler, refine_coeffs, verbose)
 
         # Stall detection: the box stopped shrinking meaningfully -> the detector floor
         # has been reached; report the converged point at the achievable precision.
         if new_box > stall_factor * boxsize:
             stalls += 1
             if stalls >= stall_patience:
-                return {"status": "converged", "reason": "detector floor", **last}
+                return _finalize_coeffs(
+                    {"status": "converged", "reason": "detector floor", **last},
+                    landscape, euler, refine_coeffs, verbose)
         else:
             stalls = 0
 
