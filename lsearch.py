@@ -986,6 +986,9 @@ def _report_iteration(it, center, spread, cloud_prec, accuracy, wp, boxsize,
     det_digits = int(max(0, -mpmath.log(spread) / mpmath.log(10))) if spread else 0
     show = det_digits + 6           # determined digits plus a few to watch them settle
     print(f"  ---- iteration {it} " + "-" * 40)
+    # current best guess of the L-point coordinates and the box being searched
+    print(f"  current guess: L-point = ({mpmath.nstr(center[0], show)}, "
+          f"{mpmath.nstr(center[1], show)})   box size = {mpmath.nstr(boxsize, 2)}")
     print(f"  spectral parameters (determined to +- {mpmath.nstr(spread, 2)}):")
     for i, c in enumerate(center, 1):
         print(f"      lambda{i} = {mpmath.nstr(c, show)}")
