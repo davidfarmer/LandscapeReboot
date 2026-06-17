@@ -1112,15 +1112,18 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
             if bs is None or not bs["cloud"]:
                 return {"status": "fail", "reason": "no solution", "iter": it}
             cond = bs["cond_solve"]
+            center, spread = cloud_center_spread(bs["cloud"])
+            new_box = min(spread * mpf("1.2"), boxsize)
             need = int(mpmath.ceil(accuracy + mpmath.log(cond) / ln10 + GUARD_DIGITS))
             if wp >= need:
                 break
-            if verbose:
-                print(f"   (redo: wp {wp} < accuracy+log10(cond)+{GUARD_DIGITS} = {need})")
+            if verbose:    # show the provisional guess so a redo isn't a silent wait
+                print(f"   provisional guess: L-point=({mpmath.nstr(center[0], 12)}, "
+                      f"{mpmath.nstr(center[1], 12)})  box size={mpmath.nstr(boxsize, 2)}")
+                print(f"   (redo: wp {wp} < accuracy+log10(cond)+{GUARD_DIGITS} = {need}"
+                      f" -> raising precision)")
             wp = need
-        center, spread = cloud_center_spread(bs["cloud"])
         cloud_prec = estimate_cloud_precision(bs)
-        new_box = min(spread * mpf("1.2"), boxsize)
         det_res = max((s["det_res"] for s in bs["sols"] if s), default=mpf(0))
         sol = _average_solution(bs["sols"])
         if verbose:
