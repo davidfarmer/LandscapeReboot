@@ -43,6 +43,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
+import time
+
 import mpmath
 from mpmath import mp, mpf, mpc
 
@@ -486,13 +488,17 @@ def _select_rows(rows, k):
     return chosen
 
 
-def _equation_jacobian(system, x, primes, n_eq):
+def _equation_jacobian(system, x, primes, n_eq, deadline=None):
     """Numerical Jacobian (central differences) of the first n_eq residual rows with
-    respect to the unknowns x.  Used to choose a well-conditioned solve/detector subset."""
+    respect to the unknowns x.  Used to choose a well-conditioned solve/detector subset.
+    Stops early (leaving later columns zero) if the wall-clock `deadline` is passed --
+    the caller then sees the deadline and bails."""
     h = mpf(10) ** (-(system.working_precision // 2 or 12))
     U = len(x)
     rows = [[mpf(0)] * U for _ in range(n_eq)]
     for j in range(U):
+        if deadline is not None and time.time() > deadline:
+            break
         xp = x[:]; xp[j] += h
         xm = x[:]; xm[j] -= h
         rp = residual(system, xp, primes=primes)
@@ -531,9 +537,14 @@ def _guess_vector(primes, guess, eps_guess):
     return pack_unknowns(eps_guess, ap, primes)
 
 
-def _broyden(F, x0, h, tol, maxiter):
+def _broyden(F, x0, h, tol, maxiter, deadline=None, stall_window=40):
     """Solve F(x)=0 by Broyden's (good) method.  Returns (x, ||F||) of the best
-    iterate found (caller decides if it is good enough); None if B goes singular."""
+    iterate found (caller decides if it is good enough); None if B goes singular.
+
+    Two early exits keep a non-converging solve (e.g. far from any L-function) from
+    burning the full maxiter: it stops if the best residual has not improved for
+    stall_window iterations (a genuine convergence keeps improving, so this is
+    false-negative-safe), or if the wall-clock `deadline` (epoch seconds) is passed."""
     n = len(x0)
     x = [mpf(v) for v in x0]
     Fx = F(x)
@@ -543,13 +554,18 @@ def _broyden(F, x0, h, tol, maxiter):
         return best
     B = mpmath.matrix(n, n)                     # initial Jacobian, forward differences
     for j in range(n):
+        if deadline is not None and time.time() > deadline:
+            return best
         xp = x[:]
         xp[j] = xp[j] + h
         Fp = F(xp)
         for i in range(n):
             B[i, j] = (Fp[i] - Fx[i]) / h
     Fxv = mpmath.matrix(Fx)
-    for _ in range(maxiter):
+    last_improve = 0
+    for it in range(maxiter):
+        if deadline is not None and time.time() > deadline:
+            return best
         try:
             dx = mpmath.lu_solve(B, -Fxv)
         except (ZeroDivisionError, ValueError):
@@ -559,8 +575,11 @@ def _broyden(F, x0, h, tol, maxiter):
         nrm = max(abs(v) for v in Fn)
         if nrm < best[1]:
             best = (x[:], nrm)
+            last_improve = it
         if nrm < tol:
             return (x[:], nrm)
+        if it - last_improve > stall_window:   # plateaued, not converging -> give up
+            return best
         Fnv = mpmath.matrix(Fn)
         dF = Fnv - Fxv
         denom = mpmath.fsum(dx[i] * dx[i] for i in range(n))
@@ -578,7 +597,7 @@ def _broyden(F, x0, h, tol, maxiter):
 
 def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
                    tol=None, det_tol=None, maxiter=150, n_detectors=8,
-                   fixed=None, verbose=False):
+                   fixed=None, deadline=None, verbose=False):
     """Find a solution at system.point, restricting the unknown primes and enlarging
     the set if no solution is found.
 
@@ -613,10 +632,12 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
         # one equation Jacobian over ALL candidate primes; per-k selection reuses its
         # columns (far cheaper than re-differencing for every prime count)
         xall = _guess_vector(cand, guess, eps_guess)
-        jac_full = _equation_jacobian(system, xall, cand, 2 * K)
+        jac_full = _equation_jacobian(system, xall, cand, 2 * K, deadline=deadline)
 
     best = None
     for k in ks:
+        if deadline is not None and time.time() > deadline:
+            break                       # out of time -> return the best found so far
         if fixed is None:
             primes = cand[:k]
             solve_idx, det_idx = _select_from_jacobian(jac_full, K, system.euler,
@@ -627,7 +648,7 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
             full = residual(system, u, primes=_pr)
             return [full[i] for i in _si]
 
-        out = _broyden(F, x0, h, tol, maxiter)
+        out = _broyden(F, x0, h, tol, maxiter, deadline=deadline)
         if out is None:             # Jacobian went singular -> set too large, stop growing
             if verbose:
                 print(f"   k={k} primes={primes}: Broyden singular")
@@ -770,7 +791,7 @@ def triangle_corners(point, h):
 
 
 def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
-             guess=None, eps_guess=None, solver="square", verbose=False):
+             guess=None, eps_guess=None, solver="square", deadline=None, verbose=False):
     """One box iteration's geometry: returns the corner solutions, the detector
     lines, and the candidate cloud (Step 4-6).
 
@@ -785,9 +806,11 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
     h = mpf(boxsize)
     corners = triangle_corners(point, h)
 
+    timed_out = lambda: deadline is not None and time.time() > deadline
+
     sys0 = build_equation_system(landscape, euler, corners[0], accuracy, working_precision)
-    sol0 = solve_at_point(sys0, guess=guess, eps_guess=eps_guess)
-    if sol0 is None:
+    sol0 = solve_at_point(sys0, guess=guess, eps_guess=eps_guess, deadline=deadline)
+    if sol0 is None or timed_out():
         return None
     k = sol0["k"]
     weights = WeightSet(weights=sys0.weights)
@@ -798,10 +821,12 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
 
     systems, sols = [sys0], [sol0]
     for c in corners[1:]:                       # continue from corner-0 solution
+        if timed_out():             # bail between corners so a timeout doesn't overshoot
+            return None
         sysc = build_equation_system(landscape, euler, c, accuracy, working_precision,
                                      weight_set=weights)
         solc = solve_at_point(sysc, guess=sol0["ap"], eps_guess=sol0["epsilon"],
-                              fixed=fixed)
+                              fixed=fixed, deadline=deadline)
         if solc is None:            # a corner solve failed -> cannot form the geometry
             return None
         systems.append(sysc)
@@ -1003,7 +1028,7 @@ def _finalize_coeffs(result, landscape, euler, refine_coeffs, verbose):
 def search(landscape, euler, point, boxsize, accuracy, working_precision, target_box,
            guess=None, eps_guess=None, max_iter=40, wander_dist=mpf("0.25"),
            stall_factor=mpf("0.9"), stall_patience=2, solver="square",
-           refine_coeffs=True, verbose=True):
+           refine_coeffs=True, timeout=600, verbose=True):
     """Iterative search (Steps 1-8): shrink a triangular box toward an L-function,
     raising the accuracy (to tighten the spectral-parameter cloud) and the working
     precision (to keep the cloud points trustworthy) as the box shrinks.
@@ -1044,12 +1069,26 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
     ln10 = mpmath.log(10)
     acc_max = _acc_max_for_target(target, ln10)   # cap accuracy at what the target needs
     stalls = 0
+    refining = False             # cheap exploration until the box first shrinks
     last = None                  # last accepted (center, new_box, wp, cloud_prec, sol)
+    deadline = (time.time() + timeout) if timeout else None
+
+    def _timed_out():
+        return deadline is not None and time.time() > deadline
 
     for it in range(max_iter):
-        # Couple accuracy to the current box: the detectors must localize the point
-        # well inside the box, otherwise the cloud (and hence the box) stalls.
-        accuracy = _accuracy_for_box(boxsize, acc_floor, acc_max, ln10)
+        if _timed_out():         # ran out of wall-clock time without a solution
+            return {"status": "timeout", "reason": "time limit", "iter": it,
+                    **(last or {"point": point})}
+        # Cheap exploration vs refinement.  Until the box has actually shrunk once (a
+        # candidate is homing in) we EXPLORE at the accuracy floor: this keeps the
+        # (atomic, uninterruptible) build cheap, so a far-from-anything point is judged
+        # and abandoned in minutes instead of grinding for hours on big-M builds.  Only
+        # after a shrink do we couple accuracy to the box and refine in earnest.
+        if refining:
+            accuracy = _accuracy_for_box(boxsize, acc_floor, acc_max, ln10)
+        else:
+            accuracy = acc_floor
         wp = max(wp, int(mpmath.ceil(accuracy)) + 6)
 
         # Box step with the precision guard.  The numerical error of every cloud point
@@ -1057,9 +1096,16 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
         # near-parallel factor, so the right guard is uniform:  wp >= accuracy +
         # log10(cond) + GUARD_DIGITS.  Redo at higher wp until it holds.
         for attempt in range(6):
+            if _timed_out():         # don't start another (re)build past the deadline
+                return {"status": "timeout", "reason": "time limit", "iter": it,
+                        **(last or {"point": point})}
             mp.dps = wp
             bs = box_step(landscape, euler, point, boxsize, int(round(accuracy)), wp,
-                          guess=g, eps_guess=eg, solver=solver, verbose=False)
+                          guess=g, eps_guess=eg, solver=solver, deadline=deadline,
+                          verbose=False)
+            if _timed_out():
+                return {"status": "timeout", "reason": "time limit", "iter": it,
+                        **(last or {"point": point})}
             if bs is None or not bs["cloud"]:
                 return {"status": "fail", "reason": "no solution", "iter": it}
             cond = bs["cond_solve"]
@@ -1096,6 +1142,8 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
 
         # Stall detection: the box stopped shrinking meaningfully -> the detector floor
         # has been reached; report the converged point at the achievable precision.
+        # A meaningful shrink is also the signal that a real candidate is here, so we
+        # switch from cheap exploration to full-accuracy refinement.
         if new_box > stall_factor * boxsize:
             stalls += 1
             if stalls >= stall_patience:
@@ -1104,6 +1152,10 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
                     landscape, euler, refine_coeffs, verbose)
         else:
             stalls = 0
+            if not refining:
+                refining = True
+                if verbose:
+                    print("   (box shrank -> switching from exploration to refinement)")
 
         avg = last["sol"]
         g, eg = avg["ap"], avg["epsilon"]
@@ -1320,12 +1372,105 @@ def selftest_m4(accuracy=8, working_precision=30, verbose=True):
     return ok
 
 
+def _search_report(res, land, a, elapsed):
+    """Build the human-readable result block for a command-line search: classify the
+    outcome (wandered / box-did-not-decrease / partial / success), report the running
+    time, and -- for a partial or full success -- the precision, accuracy, recovered
+    coefficients, and a ready-to-run command to refine the result further."""
+    ln10 = mpmath.log(10)
+
+    def nstr(x, n):
+        return mpmath.nstr(x, n)
+
+    def digits(x):
+        return max(0, int(-mpmath.log(x) / ln10)) if (x and x > 0) else 0
+
+    init_box = mpf(a.boxsize)
+    target = mpf(a.target)
+    status = res.get("status")
+    reason = res.get("reason", "")
+    box = res.get("box")
+    pt = res.get("point")
+
+    out = ["=" * 68]
+    out.append("SEARCH RESULT   landscape: %s" % land.name)
+    out.append("start point: %s    initial box: %s    target: %s"
+               % (a.point, nstr(init_box, 2), nstr(target, 2)))
+    out.append("running time: %.1f s" % elapsed)
+    if pt is not None:
+        out.append("point found: l1 = %s ,  l2 = %s" % (nstr(pt[0], 18), nstr(pt[1], 18)))
+
+    # ---- classify the outcome ------------------------------------------------
+    if status == "success":
+        kind = "success"
+        out.append("OUTCOME: SUCCESS -- the box reached the target (%s)." % nstr(target, 2))
+    elif status == "fail" and reason == "wandered":
+        kind = "wandered"
+        out.append("OUTCOME: FAILED (wandered) -- the centre drifted more than %s "
+                   "from the start point." % nstr(mpf(a.wander_dist), 2))
+    elif status == "fail" and reason == "no solution":
+        kind = "nosol"
+        out.append("OUTCOME: FAILED (no solution) -- could not solve at the start point.")
+    elif status == "timeout":
+        if box is not None and box < init_box * mpf("0.999"):
+            kind = "partial"
+            out.append("OUTCOME: TIMED OUT (partial) -- hit the time limit; the box had "
+                       "shrunk from %s to %s (target %s not reached)."
+                       % (nstr(init_box, 2), nstr(box, 2), nstr(target, 2)))
+        else:
+            kind = "timeout"
+            out.append("OUTCOME: TIMED OUT -- hit the time limit with no decrease in the "
+                       "box (no L-function resolved near the start point).")
+    elif box is not None and box < init_box * mpf("0.999"):
+        kind = "partial"
+        out.append("OUTCOME: PARTIALLY SUCCESSFUL -- the box shrank from %s to %s "
+                   "but did not reach the target %s."
+                   % (nstr(init_box, 2), nstr(box, 2), nstr(target, 2)))
+    else:
+        kind = "noprogress"
+        out.append("OUTCOME: FAILED (box did not decrease) -- no L-function was "
+                   "resolved near the start point.")
+
+    # ---- precision / accuracy + refine command (success or partial) ----------
+    if kind in ("success", "partial"):
+        out.append("spectral parameters determined to +- %s  (about %d digits)."
+                   % (nstr(box, 2), digits(box)))
+        cp = res.get("cloud_prec")
+        if cp is not None:
+            out.append("numerical precision of the cloud points: %s." % nstr(cp, 2))
+        out.append("accuracy used: %d digits;  working precision: %d digits."
+                   % (res.get("accuracy", 0), res.get("wp", 0)))
+        cfr = res.get("coeff_fit_res")
+        if cfr is not None:
+            out.append("coefficient least-squares fit residual: %s." % nstr(cfr, 2))
+        sol = res.get("sol")
+        if sol:
+            out.append("sign epsilon = %s" % nstr(sol["epsilon"], 12))
+            for pp in sol["primes"]:
+                out.append("  a_%-3d = %s" % (pp, nstr(sol["ap"][pp], 12)))
+        # finer target: push 3 orders past a success, retry the original on a partial
+        r_target = box * mpf("1e-3") if kind == "success" else target
+        r_wp = res.get("wp", a.working_precision) + 10
+        r_acc = res.get("accuracy", a.accuracy)
+        out.append("")
+        out.append("To refine further, run:")
+        out.append("  python3 lsearch.py search --point=%s,%s --conductor %d \\"
+                   % (nstr(pt[0], 20), nstr(pt[1], 20), land.conductor))
+        out.append("    --boxsize %s --accuracy %d --working-precision %d \\"
+                   % (nstr(box, 4), r_acc, r_wp))
+        out.append("    --target %s --epsilon 1 --max-iter 12" % nstr(r_target, 2))
+
+    out.append("=" * 68)
+    return "\n".join(out)
+
+
 def _search_cli(argv):
     """Command-line search of the degree-3, tempered, conductor-N GL(3) Maass-form
     landscape with Gamma factors
         Gamma_R(s + i*l1) Gamma_R(s + i*l2) Gamma_R(s - i*(l1+l2)),
     cold-started (Euler coefficients unknown) from a given spectral point."""
     import argparse
+    import time
     p = argparse.ArgumentParser(
         prog="lsearch.py search",
         description="Search the degree-3, tempered, conductor-N GL(3) landscape "
@@ -1345,6 +1490,10 @@ def _search_cli(argv):
                    help="sign (root number) guess, e.g. '1' or '0.6+0.8j'")
     p.add_argument("--wander-dist", default="0.25",
                    help="abort if the centre drifts this far (absolute) from the start")
+    p.add_argument("--timeout", type=float, default=600,
+                   help="wall-clock seconds before giving up if no solution found (default 600)")
+    p.add_argument("--append", default=None, metavar="FILE",
+                   help="append the result report to this file (e.g. to log a grid of searches)")
     a = p.parse_args(argv)
 
     l1, l2 = (mpf(t.strip()) for t in a.point.split(","))
@@ -1355,21 +1504,21 @@ def _search_cli(argv):
         mu_from_point=lambda pt: [1j * mpf(pt[0]), 1j * mpf(pt[1]),
                                   -1j * (mpf(pt[0]) + mpf(pt[1]))],
         nu_from_point=lambda pt: [])
+    t0 = time.time()
     res = search(land, GL3_EULER, (l1, l2), mpf(a.boxsize), a.accuracy,
                  a.working_precision, mpf(a.target), guess=None,
                  eps_guess=mpc(complex(a.epsilon.replace(" ", ""))),
-                 max_iter=a.max_iter, wander_dist=mpf(a.wander_dist), verbose=True)
+                 max_iter=a.max_iter, wander_dist=mpf(a.wander_dist),
+                 timeout=a.timeout, verbose=True)
+    elapsed = time.time() - t0
+
+    report = _search_report(res, land, a, elapsed)
     print()
-    print("STATUS:", res["status"], res.get("reason", ""))
-    c = res.get("point")
-    if c is not None:
-        print("point = (%s, %s)" % (mpmath.nstr(c[0], 16), mpmath.nstr(c[1], 16)))
-        print("box   =", mpmath.nstr(res.get("box", 0), 3))
-    sol = res.get("sol")
-    if sol:
-        print("sign epsilon =", mpmath.nstr(sol["epsilon"], 12))
-        for pp in sol["primes"]:
-            print("  a_%-3d = %s" % (pp, mpmath.nstr(sol["ap"][pp], 12)))
+    print(report)
+    if a.append:
+        with open(a.append, "a") as fh:
+            fh.write(report + "\n\n")
+        print("(appended to %s)" % a.append)
 
 
 if __name__ == "__main__":
