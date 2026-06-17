@@ -658,6 +658,82 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
     return best
 
 
+def solve_at_point_lsq(system, guess=None, eps_guess=None, k=None, n_eq=None,
+                       tol=None, maxiter=40, damping=mpf("1e-30"), verbose=False):
+    """PROTOTYPE overdetermined least-squares solve at system.point.
+
+    Instead of a square system (U unknowns, U equations) it fits MANY more equations
+    than unknowns by Gauss-Newton, minimizing the L2 residual over a QR-selected,
+    well-conditioned set of equations (plus the sign normalization).  The redundancy
+    averages down the per-equation noise, and the weakly-determined high-prime unknowns
+    absorb their Dirichlet terms instead of biasing the well-determined low ones -- so
+    the low coefficients and the spectral parameters come out sharper.
+
+    Each Gauss-Newton step solves  min || J du + F ||  via QR (no normal-equation
+    squaring); a tiny Levenberg-Marquardt damping stabilizes the near-dependent
+    high-prime directions without perturbing the determined ones.  Returns a dict with
+    the coefficients, the L2 residual of the fitted set, and the max residual over ALL
+    equations (a global goodness-of-fit)."""
+    cand = system.primes
+    if not cand:
+        return None
+    if k is None:
+        k = len(cand)
+    primes = cand[:k]
+    U = 2 + system.euler.real_unknowns_per_prime * k
+    if eps_guess is None:
+        eps_guess = mpc(1)
+    if tol is None:
+        tol = mpf(10) ** (-(system.accuracy))
+    K = len(system.A)
+    norm_idx = 2 * K
+    # fit as many well-conditioned equations as asked (default: a generous multiple of
+    # the unknowns), chosen by QR pivoting; always include the sign normalization
+    if n_eq is None:
+        n_eq = min(2 * K, 4 * U)
+    x = _guess_vector(primes, guess, eps_guess)
+    jac0 = _equation_jacobian(system, x, primes, 2 * K)
+    eq_idx = _select_rows(jac0, n_eq) + [norm_idx]
+    h = mpf(10) ** (-(system.working_precision // 2))
+
+    def Fvec(u):
+        full = residual(system, u, primes=primes)
+        return [full[i] for i in eq_idx]
+
+    nrm = None
+    for _ in range(maxiter):
+        Fx = Fvec(x)
+        nrm = max(abs(v) for v in Fx)
+        if nrm < tol:
+            break
+        J = [[mpf(0)] * U for _ in range(len(eq_idx))]
+        for j in range(U):
+            xp = x[:]; xp[j] += h
+            xm = x[:]; xm[j] -= h
+            rp = Fvec(xp); rm = Fvec(xm)
+            for i in range(len(eq_idx)):
+                J[i][j] = (rp[i] - rm[i]) / (2 * h)
+        Jm = mpmath.matrix(J)
+        Fv = mpmath.matrix(Fx)
+        try:                                    # least-squares step via QR
+            du = mpmath.qr_solve(Jm, -Fv)[0]
+        except Exception:                       # rank-deficient -> damped normal eqs
+            JtJ = Jm.T * Jm
+            for i in range(U):
+                JtJ[i, i] += damping
+            du = mpmath.lu_solve(JtJ, -(Jm.T * Fv))
+        x = [x[i] + du[i] for i in range(U)]
+
+    eps, ap = unpack_unknowns(x, primes)
+    full = residual(system, x, primes=primes)
+    all_res = max(abs(full[i]) for i in range(2 * K))   # fit over EVERY equation
+    if verbose:
+        print(f"   lsq k={k}: n_eq={len(eq_idx)} ||fit||={mpmath.nstr(nrm,3)} "
+              f"all_res={mpmath.nstr(all_res,3)}")
+    return {"primes": primes, "epsilon": eps, "ap": ap, "x": x, "k": k,
+            "lsq_res": nrm, "all_res": all_res, "n_eq": len(eq_idx)}
+
+
 # ---------------------------------------------------------------------------
 # M4.  Box geometry: detectors -> hyperplanes -> candidate cloud
 # ---------------------------------------------------------------------------
