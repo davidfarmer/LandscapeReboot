@@ -1172,8 +1172,8 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
         avg = last["sol"]
         g, eg = avg["ap"], avg["epsilon"]
         point, boxsize = center, new_box
-    return {"status": "fail", "reason": "max_iter", "iter": max_iter,
-            **(last or {"point": point})}
+    return {"status": "fail", "reason": "max_iter",
+            **(last or {"point": point}), "iter": it}
 
 
 # ---------------------------------------------------------------------------
@@ -1408,7 +1408,9 @@ def _search_report(res, land, a, elapsed):
     out.append("SEARCH RESULT   landscape: %s" % land.name)
     out.append("start point: %s    initial box: %s    target: %s"
                % (a.point, nstr(init_box, 2), nstr(target, 2)))
-    out.append("running time: %.1f s" % elapsed)
+    iters = res.get("iter")
+    out.append("iterations done: %s    running time: %.1f s"
+               % ("?" if iters is None else iters + 1, elapsed))
     if pt is not None:
         out.append("point found: l1 = %s ,  l2 = %s" % (nstr(pt[0], 18), nstr(pt[1], 18)))
 
