@@ -1,0 +1,8 @@
+====================================================================
+SEARCH RESULT   landscape: GL(3) degree 3, conductor 1
+start point: 14.1,2.3    initial box: 0.001    target: 1.0e-10
+iterations done: 2    running time: 661.3 s
+point found: l1 = 14.1432245736374705 ,  l2 = 2.35629404339423364
+OUTCOME: FAILED (box did not decrease) -- no L-function was resolved near the start point.
+====================================================================
+

@@ -43,6 +43,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
+import random
 import time
 
 import mpmath
@@ -790,6 +791,36 @@ def triangle_corners(point, h):
     return [p, (p[0] + h, p[1]), (p[0], p[1] + h)]
 
 
+def _cloud_from_corners(systems, sols, point, h, detector_idx, working_precision):
+    """From the corner solutions, affinely model each detector over the box and
+    intersect the zero-lines pairwise into a candidate cloud.  Returns
+    (cloud, cloud_info, lines)."""
+    Dvals = []
+    for i in range(3):
+        full = residual(systems[i], sols[i]["x"], primes=sols[i]["primes"])
+        Dvals.append([full[d] for d in detector_idx])
+    # affine model of each detector: D(d1,d2) = D0 + g1 d1 + g2 d2  (d = offset from P)
+    lines = []
+    for d in range(len(detector_idx)):
+        D0, D1, D2 = Dvals[0][d], Dvals[1][d], Dvals[2][d]
+        lines.append((D0, (D1 - D0) / h, (D2 - D0) / h))
+    cloud, cloud_info = [], []
+    nd = len(lines)
+    for i in range(nd):
+        for j in range(i + 1, nd):
+            D0i, g1i, g2i = lines[i]
+            D0j, g1j, g2j = lines[j]
+            det = g1i * g2j - g2i * g1j
+            if abs(det) < mpf(10) ** (-(working_precision - 4)) * (abs(g1i) + abs(g2i) + 1):
+                continue                        # near-parallel -> unstable, skip
+            d1 = (-D0i * g2j + g2i * D0j) / det
+            d2 = (-g1i * D0j + g1j * D0i) / det
+            Minv_norm = max(abs(g2j) + abs(g2i), abs(g1j) + abs(g1i)) / abs(det)
+            cloud.append((point[0] + d1, point[1] + d2))
+            cloud_info.append({"offset": max(abs(d1), abs(d2)), "Minv": Minv_norm})
+    return cloud, cloud_info, lines
+
+
 def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
              guess=None, eps_guess=None, solver="square", deadline=None, verbose=False):
     """One box iteration's geometry: returns the corner solutions, the detector
@@ -846,41 +877,13 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
             eps_r, ap_r = unpack_unknowns(x_ref, primes)
             sols[i] = {**sols[i], "x": x_ref, "epsilon": eps_r, "ap": ap_r}
 
-    # detector value vector at each corner (using that corner's own solution)
-    Dvals = []
-    for i in range(3):
-        full = residual(systems[i], sols[i]["x"], primes=sols[i]["primes"])
-        Dvals.append([full[d] for d in detector_idx])
-
-    # affine model of each detector: D(d1,d2) = D0 + g1 d1 + g2 d2  (d = offset from P)
-    lines = []
-    for d in range(len(detector_idx)):
-        D0, D1, D2 = Dvals[0][d], Dvals[1][d], Dvals[2][d]
-        lines.append((D0, (D1 - D0) / h, (D2 - D0) / h))
-
-    # pairwise intersection of the detector zero-lines -> cloud.  Record, per point,
-    # the offset |Delta| from P and the inverse-matrix norm ||M^{-1}|| -- both needed
-    # to estimate how much precision the intersection costs.
-    cloud, cloud_info = [], []
-    nd = len(lines)
-    for i in range(nd):
-        for j in range(i + 1, nd):
-            D0i, g1i, g2i = lines[i]
-            D0j, g1j, g2j = lines[j]
-            det = g1i * g2j - g2i * g1j
-            if abs(det) < mpf(10) ** (-(working_precision - 4)) * (abs(g1i) + abs(g2i) + 1):
-                continue                        # near-parallel -> unstable, skip
-            d1 = (-D0i * g2j + g2i * D0j) / det
-            d2 = (-g1i * D0j + g1j * D0i) / det
-            Minv_norm = max(abs(g2j) + abs(g2i), abs(g1j) + abs(g1i)) / abs(det)
-            cloud.append((point[0] + d1, point[1] + d2))
-            cloud_info.append({"offset": max(abs(d1), abs(d2)), "Minv": Minv_norm})
+    # detector zero-lines from the 3 corners, intersected pairwise into a cloud
+    cloud, cloud_info, lines = _cloud_from_corners(
+        systems, sols, point, h, detector_idx, working_precision)
 
     # precision lost in recovering the coefficients (solve conditioning at corner 0)
     cond_solve = sol0["cond"]
     if verbose:
-        print(f"   corner detector norms: "
-              f"{[mpmath.nstr(max(abs(v) for v in Dvals[i]),2) for i in range(3)]}")
         print(f"   cloud size = {len(cloud)}, solve cond = {mpmath.nstr(cond_solve,3)}")
     return {"corners": corners, "sols": sols, "lines": lines, "cloud": cloud,
             "cloud_info": cloud_info, "detector_idx": detector_idx, "k": k,
@@ -1003,6 +1006,146 @@ def _report_iteration(it, center, spread, cloud_prec, accuracy, wp, boxsize,
     print(f"  Euler coefficients a_p:")
     for p in sol["primes"]:
         print(f"      a_{p:<3d}= {mpmath.nstr(sol['ap'][p], 12)}")
+
+
+def _random_ap(primes, scale):
+    """A random Euler-coefficient guess (uniform in the box |Re|,|Im| <= scale) used as a
+    Broyden restart; different restarts find different solutions of the system."""
+    return {p: mpc(2 * scale * (mpf(random.random()) - mpf("0.5")),
+                   2 * scale * (mpf(random.random()) - mpf("0.5"))) for p in primes}
+
+
+def _coeff_distance(apA, apB):
+    """Distance between two coefficient solutions, weighted toward the SMALLER primes
+    (which are determined accurately; larger primes carry the numerical noise).  Used to
+    decide whether two candidates are the SAME solution of the system -- so two distinct
+    L-functions that share a (near-)identical spectral point are kept apart by their
+    coefficients."""
+    common = sorted(set(apA) & set(apB))
+    if not common:
+        return mpmath.inf
+    num = mpmath.fsum(abs(apA[p] - apB[p]) / p for p in common)
+    den = mpmath.fsum(mpf(1) / p for p in common)
+    return num / den
+
+
+def explore_candidates(landscape, euler, point, boxsize, accuracy, working_precision,
+                       restarts=20, guess=None, eps_guess=None, k_min=3, k_max=None,
+                       coeff_tol=mpf("0.05"), max_candidates=5, scale=mpf(2),
+                       deadline=None, verbose=True):
+    """Find DISTINCT candidate solutions of the system near `point`.
+
+    Varies the number of coefficients k (from k_min up to the available significant
+    primes) and tries `restarts` random Broyden starts at each k (plus the given guess).
+    Each corner-0 solution is kept; they are de-duplicated by their COEFFICIENT vectors
+    (weighted toward small primes), keeping the lowest-detector-residual representative of
+    each distinct solution -- so different L-functions at a (near-)identical point survive
+    separately.  For each distinct candidate the cloud centre (a provisional L-point) is
+    then computed from the other two corners.  Returns a list of candidate dicts
+    (center, spread, ap, epsilon, det, k)."""
+    h = mpf(boxsize)
+    corners = triangle_corners(point, h)
+    mp.dps = working_precision
+    sys0 = build_equation_system(landscape, euler, corners[0], accuracy, working_precision)
+    weights = WeightSet(weights=sys0.weights)
+    systems = [sys0] + [build_equation_system(landscape, euler, c, accuracy,
+                        working_precision, weight_set=weights) for c in corners[1:]]
+    cand_primes = sys0.primes
+    if not cand_primes:
+        return []
+    if k_max is None:
+        k_max = len(cand_primes)
+    k_max = min(k_max, len(cand_primes))
+    k_min = max(1, min(k_min, k_max))
+    eps_guess = eps_guess or mpc(1)
+
+    # (1) corner-0 solutions over k and random restarts (re-solves on the one build)
+    sols0 = []
+    for k in range(k_min, k_max + 1):
+        primes = cand_primes[:k]
+        seeds = ([guess] if guess is not None else []) + \
+                [_random_ap(primes, scale) for _ in range(restarts)] + [None]
+        for seed in seeds:
+            if deadline is not None and time.time() > deadline:
+                break
+            s = solve_at_point(sys0, guess=seed, eps_guess=eps_guess,
+                               k_init=k, k_max=k, deadline=deadline)
+            if s is not None:
+                sols0.append(s)
+        if deadline is not None and time.time() > deadline:
+            break
+
+    # (2) de-duplicate by coefficient vector; keep best-det representative of each
+    sols0.sort(key=lambda s: s["det_res"])
+    reps = []
+    for s in sols0:
+        if any(_coeff_distance(s["ap"], r["ap"]) < coeff_tol for r in reps):
+            continue
+        reps.append(s)
+        if len(reps) >= max_candidates:
+            break
+
+    # (3) cloud centre of each distinct candidate (from the other two corners)
+    out = []
+    for s in reps:
+        fixed = (s["solve_idx"], s["det_idx"], s["primes"])
+        sols, ok = [s], True
+        for i in (1, 2):
+            sc = solve_at_point(systems[i], guess=s["ap"], eps_guess=s["epsilon"],
+                                fixed=fixed)
+            if sc is None:
+                ok = False
+                break
+            sols.append(sc)
+        if not ok:
+            continue
+        cloud, _ci, _ln = _cloud_from_corners(systems, sols, point, h,
+                                              s["det_idx"], working_precision)
+        if not cloud:
+            continue
+        center, spread = cloud_center_spread(cloud)
+        out.append({"center": center, "spread": spread, "ap": s["ap"],
+                    "epsilon": s["epsilon"], "det": s["det_res"], "k": s["k"]})
+    if verbose:
+        print(f"  exploration: {len(sols0)} solutions over k={k_min}..{k_max}, "
+              f"{len(out)} distinct candidate(s)")
+        for n, c in enumerate(out):
+            print(f"    candidate {n}: center=({mpmath.nstr(c['center'][0],10)}, "
+                  f"{mpmath.nstr(c['center'][1],10)})  k={c['k']}  "
+                  f"det={mpmath.nstr(c['det'],2)}")
+    return out
+
+
+def search_landscape(landscape, euler, point, boxsize, accuracy, working_precision,
+                     target_box, restarts=20, eps_guess=None, max_iter=40,
+                     wander_dist=mpf("0.25"), timeout=600, refine_coeffs=True,
+                     coeff_tol=mpf("0.05"), max_candidates=5, verbose=True):
+    """Explore near `point` for distinct candidate solutions (varying k and random
+    Broyden restarts), then refine EACH distinct candidate into an L-point.  The time
+    limit guards only the exploration; refinement of a real candidate runs to completion.
+    Returns a list of result dicts (one per candidate refined), each with 'secs'."""
+    explore_acc = int(round(mpf(accuracy)))
+    explore_wp = max(int(working_precision), 2 * explore_acc + 20)
+    deadline = (time.time() + timeout) if timeout else None
+    cands = explore_candidates(landscape, euler, point, boxsize, explore_acc, explore_wp,
+                               restarts=restarts, eps_guess=eps_guess, coeff_tol=coeff_tol,
+                               max_candidates=max_candidates, deadline=deadline,
+                               verbose=verbose)
+    results = []
+    for n, cand in enumerate(cands):
+        if verbose:
+            print(f"  === refining candidate {n} at ({mpmath.nstr(cand['center'][0],10)}, "
+                  f"{mpmath.nstr(cand['center'][1],10)}) ===")
+        t0 = time.time()
+        res = search(landscape, euler, cand["center"], boxsize, accuracy,
+                     working_precision, target_box, guess=cand["ap"],
+                     eps_guess=cand["epsilon"], max_iter=max_iter,
+                     wander_dist=wander_dist, timeout=timeout,
+                     refine_coeffs=refine_coeffs, verbose=verbose)
+        res["secs"] = time.time() - t0
+        res["candidate"] = n
+        results.append(res)
+    return results
 
 
 def _finalize_coeffs(result, landscape, euler, refine_coeffs, verbose):
@@ -1478,11 +1621,33 @@ def _search_report(res, land, a, elapsed):
     return "\n".join(out)
 
 
+def _parse_coeffs(text):
+    """Parse a starting-coefficient string into a {prime: a_p} dict.  Comma-separated:
+    bare values map positionally to the primes 2,3,5,7,11,...; 'p:val' tokens set a
+    specific prime.  Returns None for empty input."""
+    if not text or not text.strip():
+        return None
+    primes = primes_up_to(10 ** 4)
+    out, pos = {}, 0
+    for tok in text.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if ":" in tok:
+            p, v = tok.split(":")
+            out[int(p)] = mpc(complex(v.replace(" ", "")))
+        else:
+            out[primes[pos]] = mpc(complex(tok.replace(" ", "")))
+            pos += 1
+    return out
+
+
 def _search_cli(argv):
     """Command-line search of the degree-3, tempered, conductor-N GL(3) Maass-form
     landscape with Gamma factors
         Gamma_R(s + i*l1) Gamma_R(s + i*l2) Gamma_R(s - i*(l1+l2)),
-    cold-started (Euler coefficients unknown) from a given spectral point."""
+    cold-started (Euler coefficients unknown) from a given spectral point, or
+    warm-started from supplied coefficients via --coeffs."""
     import argparse
     import time
     p = argparse.ArgumentParser(
@@ -1505,9 +1670,16 @@ def _search_cli(argv):
     p.add_argument("--wander-dist", default="0.25",
                    help="abort if the centre drifts this far (absolute) from the start")
     p.add_argument("--timeout", type=float, default=600,
-                   help="wall-clock seconds before giving up if no solution found (default 600)")
+                   help="wall-clock seconds for the exploration phase only (default 600)")
+    p.add_argument("--restarts", type=int, default=20,
+                   help="random Broyden restarts per coefficient count in exploration")
+    p.add_argument("--coeffs", default=None,
+                   help="starting Euler coefficients to warm-start from, as a comma list "
+                        "a_2,a_3,a_5,a_7,... (positional by prime) and/or 'p:val' tokens, "
+                        "e.g. '-0.42-1.07j,-0.77+1.31j,-0.40-0.24j'.  When given, the "
+                        "search warm-starts from them instead of cold random exploration.")
     p.add_argument("--append", default=None, metavar="FILE",
-                   help="append the result report to this file (e.g. to log a grid of searches)")
+                   help="append the result report(s) to this file (e.g. to log a grid)")
     a = p.parse_args(argv)
 
     l1, l2 = (mpf(t.strip()) for t in a.point.split(","))
@@ -1518,20 +1690,43 @@ def _search_cli(argv):
         mu_from_point=lambda pt: [1j * mpf(pt[0]), 1j * mpf(pt[1]),
                                   -1j * (mpf(pt[0]) + mpf(pt[1]))],
         nu_from_point=lambda pt: [])
+    eg = mpc(complex(a.epsilon.replace(" ", "")))
+    guess = _parse_coeffs(a.coeffs)
     t0 = time.time()
-    res = search(land, GL3_EULER, (l1, l2), mpf(a.boxsize), a.accuracy,
-                 a.working_precision, mpf(a.target), guess=None,
-                 eps_guess=mpc(complex(a.epsilon.replace(" ", ""))),
-                 max_iter=a.max_iter, wander_dist=mpf(a.wander_dist),
-                 timeout=a.timeout, verbose=True)
+    if guess is not None:
+        # warm start: refine directly from the supplied coefficients at the given point
+        res = search(land, GL3_EULER, (l1, l2), mpf(a.boxsize), a.accuracy,
+                     a.working_precision, mpf(a.target), guess=guess, eps_guess=eg,
+                     max_iter=a.max_iter, wander_dist=mpf(a.wander_dist),
+                     timeout=a.timeout, verbose=True)
+        res["secs"] = time.time() - t0
+        results = [res]
+    else:
+        results = search_landscape(
+            land, GL3_EULER, (l1, l2), mpf(a.boxsize), a.accuracy, a.working_precision,
+            mpf(a.target), restarts=a.restarts, eps_guess=eg,
+            max_iter=a.max_iter, wander_dist=mpf(a.wander_dist), timeout=a.timeout,
+            verbose=True)
     elapsed = time.time() - t0
 
-    report = _search_report(res, land, a, elapsed)
+    blocks = []
+    if not results:
+        blocks.append("=" * 68 + "\nNo candidate solutions found near %s within %s s.\n"
+                      % (a.point, mpmath.nstr(mpf(a.timeout), 3)) + "=" * 68)
+    else:
+        succ = sum(1 for r in results if r.get("status") in ("success", "converged"))
+        blocks.append("FOUND %d candidate(s); %d refined to an L-point. "
+                      "total time %.1f s." % (len(results), succ, elapsed))
+        for r in results:
+            blocks.append("CANDIDATE %s:\n%s"
+                          % (r.get("candidate", "?"),
+                             _search_report(r, land, a, r.get("secs", elapsed))))
+    out = "\n\n".join(blocks)
     print()
-    print(report)
+    print(out)
     if a.append:
         with open(a.append, "a") as fh:
-            fh.write(report + "\n\n")
+            fh.write(out + "\n\n")
         print("(appended to %s)" % a.append)
 
 

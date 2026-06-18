@@ -69,6 +69,23 @@ python3 lsearch.py search --point "14.14,2.4" --conductor 1 \
 
 -----
 
+SEARCH warm-started from GIVEN starting coefficients.  If you already have
+approximate Euler coefficients (from a nearby form, or a previous run's output),
+pass them with --coeffs as a comma list a_2,a_3,a_5,a_7,... (positional by prime;
+'p:val' tokens also work).  The search then warm-starts from them instead of doing
+cold random exploration, which greatly extends the reach.  Here it homes onto the
+GL(3) form at (14.14163559, 2.38038849) from the farther start (14.1, 2.3), which a
+cold search does not reach.
+NOTE: because the coefficient values start with a minus sign, use --coeffs=... (with
+the equals sign), as for a negative --point.
+
+python3 lsearch.py search --point "14.1,2.3" --conductor 1 \
+          --boxsize 1e-3 --accuracy 8 --working-precision 30 \
+          --target 1e-6 --epsilon 1 --max-iter 12 \
+          --coeffs=-0.1052409+0.7507265j,1.2359943-0.0391124j,0.1345746+0.1546321j,-0.9009891-0.4776288j
+
+-----
+
 Self-tests (fast validation that the engine and the search machinery are sound):
 
 python3 afe.py selftest --accuracy 20
