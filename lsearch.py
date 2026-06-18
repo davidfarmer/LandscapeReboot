@@ -1117,12 +1117,13 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
             need = int(mpmath.ceil(accuracy + mpmath.log(cond) / ln10 + GUARD_DIGITS))
             if wp >= need:
                 break
+            new_wp = need + 3       # 3 digits of headroom so we don't redo again at once
             if verbose:    # show the provisional guess so a redo isn't a silent wait
                 print(f"   provisional guess: L-point=({mpmath.nstr(center[0], 12)}, "
                       f"{mpmath.nstr(center[1], 12)})  box size={mpmath.nstr(boxsize, 2)}")
                 print(f"   (redo: wp {wp} < accuracy+log10(cond)+{GUARD_DIGITS} = {need}"
-                      f" -> raising precision)")
-            wp = need
+                      f" -> raising wp to {new_wp})")
+            wp = new_wp
         cloud_prec = estimate_cloud_precision(bs)
         det_res = max((s["det_res"] for s in bs["sols"] if s), default=mpf(0))
         sol = _average_solution(bs["sols"])
@@ -1163,6 +1164,9 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
                 if verbose:
                     print("   (box shrank -> switching from exploration to refinement)")
 
+        if verbose and new_box < boxsize:
+            print(f"   box size decreased: {mpmath.nstr(boxsize, 2)} -> "
+                  f"{mpmath.nstr(new_box, 2)}")
         avg = last["sol"]
         g, eg = avg["ap"], avg["epsilon"]
         point, boxsize = center, new_box
