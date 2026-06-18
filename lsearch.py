@@ -1008,11 +1008,21 @@ def _report_iteration(it, center, spread, cloud_prec, accuracy, wp, boxsize,
         print(f"      a_{p:<3d}= {mpmath.nstr(sol['ap'][p], 12)}")
 
 
-def _random_ap(primes, scale):
+def _random_ap(primes, scale, fixed=None):
     """A random Euler-coefficient guess (uniform in the box |Re|,|Im| <= scale) used as a
-    Broyden restart; different restarts find different solutions of the system."""
-    return {p: mpc(2 * scale * (mpf(random.random()) - mpf("0.5")),
-                   2 * scale * (mpf(random.random()) - mpf("0.5"))) for p in primes}
+    Broyden restart; different restarts find different solutions of the system.  Any
+    coefficient supplied in `fixed` is KEPT (used as its starting value); only the
+    remaining coefficients are randomized -- so a partial --coeffs seed pins the known
+    primes while the rest are explored randomly."""
+    fixed = fixed or {}
+    out = {}
+    for p in primes:
+        if p in fixed:
+            out[p] = mpc(fixed[p])
+        else:
+            out[p] = mpc(2 * scale * (mpf(random.random()) - mpf("0.5")),
+                         2 * scale * (mpf(random.random()) - mpf("0.5")))
+    return out
 
 
 def _coeff_distance(apA, apB):
@@ -1063,8 +1073,10 @@ def explore_candidates(landscape, euler, point, boxsize, accuracy, working_preci
     sols0 = []
     for k in range(k_min, k_max + 1):
         primes = cand_primes[:k]
+        # seeds: the given guess (known primes + zeros), then random restarts that KEEP
+        # any given coefficients and randomize the rest, then a cold (all-zero) start
         seeds = ([guess] if guess is not None else []) + \
-                [_random_ap(primes, scale) for _ in range(restarts)] + [None]
+                [_random_ap(primes, scale, fixed=guess) for _ in range(restarts)] + [None]
         for seed in seeds:
             if deadline is not None and time.time() > deadline:
                 break
@@ -1117,20 +1129,22 @@ def explore_candidates(landscape, euler, point, boxsize, accuracy, working_preci
 
 
 def search_landscape(landscape, euler, point, boxsize, accuracy, working_precision,
-                     target_box, restarts=20, eps_guess=None, max_iter=40,
+                     target_box, restarts=20, guess=None, eps_guess=None, max_iter=40,
                      wander_dist=mpf("0.25"), timeout=600, refine_coeffs=True,
                      coeff_tol=mpf("0.05"), max_candidates=5, verbose=True):
     """Explore near `point` for distinct candidate solutions (varying k and random
     Broyden restarts), then refine EACH distinct candidate into an L-point.  The time
     limit guards only the exploration; refinement of a real candidate runs to completion.
-    Returns a list of result dicts (one per candidate refined), each with 'secs'."""
+    If `guess` is given (some starting coefficients) it is kept across the random restarts
+    and only the remaining coefficients are randomized.  Returns a list of result dicts
+    (one per candidate refined), each with 'secs'."""
     explore_acc = int(round(mpf(accuracy)))
     explore_wp = max(int(working_precision), 2 * explore_acc + 20)
     deadline = (time.time() + timeout) if timeout else None
     cands = explore_candidates(landscape, euler, point, boxsize, explore_acc, explore_wp,
-                               restarts=restarts, eps_guess=eps_guess, coeff_tol=coeff_tol,
-                               max_candidates=max_candidates, deadline=deadline,
-                               verbose=verbose)
+                               restarts=restarts, guess=guess, eps_guess=eps_guess,
+                               coeff_tol=coeff_tol, max_candidates=max_candidates,
+                               deadline=deadline, verbose=verbose)
     results = []
     for n, cand in enumerate(cands):
         if verbose:
@@ -1237,38 +1251,58 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
             accuracy = _accuracy_for_box(boxsize, acc_floor, acc_max, ln10)
         else:
             accuracy = acc_floor
-        wp = max(wp, int(mpmath.ceil(accuracy)) + 6)
 
-        # Box step with the precision guard.  The numerical error of every cloud point
-        # and its genuine (accuracy-limited) spread are both amplified by the same
-        # near-parallel factor, so the right guard is uniform:  wp >= accuracy +
-        # log10(cond) + GUARD_DIGITS.  Redo at higher wp until it holds.
-        for attempt in range(6):
-            if _timed_out():         # don't start another (re)build past the deadline
-                return {"status": "timeout", "reason": "time limit", "iter": it,
-                        **(last or {"point": point})}
-            mp.dps = wp
-            bs = box_step(landscape, euler, point, boxsize, int(round(accuracy)), wp,
-                          guess=g, eps_guess=eg, solver=solver,
-                          deadline=(None if refining else deadline), verbose=False)
-            if _timed_out():
-                return {"status": "timeout", "reason": "time limit", "iter": it,
-                        **(last or {"point": point})}
-            if bs is None or not bs["cloud"]:
-                return {"status": "fail", "reason": "no solution", "iter": it}
-            cond = bs["cond_solve"]
-            center, spread = cloud_center_spread(bs["cloud"])
-            new_box = min(spread * mpf("1.2"), boxsize)
-            need = int(mpmath.ceil(accuracy + mpmath.log(cond) / ln10 + GUARD_DIGITS))
-            if wp >= need:
+        # Box step with two coupled guards, each of which redoes the step:
+        #  - precision guard (inner): wp >= accuracy + log10(cond) + GUARD_DIGITS, since a
+        #    cloud point's round-off and its genuine spread share the near-parallel
+        #    amplification;
+        #  - accuracy guard (outer): the determination (cloud spread) must fit INSIDE the
+        #    box, or the box can never shrink.  If it does not, RAISE the accuracy and
+        #    redo -- but only while raising accuracy keeps shrinking the determination, so
+        #    a coarse genuine candidate refines while a non-L-point (where more accuracy
+        #    does not help) is abandoned quickly.
+        prev_spread = None
+        while True:
+            wp = max(wp, int(mpmath.ceil(accuracy)) + 6)
+            for attempt in range(6):
+                if _timed_out():     # don't start another (re)build past the deadline
+                    return {"status": "timeout", "reason": "time limit", "iter": it,
+                            **(last or {"point": point})}
+                mp.dps = wp
+                bs = box_step(landscape, euler, point, boxsize, int(round(accuracy)), wp,
+                              guess=g, eps_guess=eg, solver=solver,
+                              deadline=(None if refining else deadline), verbose=False)
+                if _timed_out():
+                    return {"status": "timeout", "reason": "time limit", "iter": it,
+                            **(last or {"point": point})}
+                if bs is None or not bs["cloud"]:
+                    return {"status": "fail", "reason": "no solution", "iter": it}
+                cond = bs["cond_solve"]
+                center, spread = cloud_center_spread(bs["cloud"])
+                new_box = min(spread * mpf("1.2"), boxsize)
+                need = int(mpmath.ceil(accuracy + mpmath.log(cond) / ln10 + GUARD_DIGITS))
+                if wp >= need:
+                    break
+                new_wp = need + 3   # 3 digits of headroom so we don't redo again at once
+                if verbose:    # show the provisional guess so a redo isn't a silent wait
+                    print(f"   provisional guess: L-point=({mpmath.nstr(center[0], 12)}, "
+                          f"{mpmath.nstr(center[1], 12)})  box size={mpmath.nstr(boxsize, 2)}")
+                    print(f"   (redo: wp {wp} < accuracy+log10(cond)+{GUARD_DIGITS} = "
+                          f"{need} -> raising wp to {new_wp})")
+                wp = new_wp
+            if new_box < boxsize or int(round(accuracy)) >= acc_max:
+                break               # determination fits the box, or accuracy maxed out
+            if prev_spread is not None and spread > prev_spread * stall_factor:
+                break               # raising accuracy isn't shrinking it -> not a form
+            new_acc = min(mpf(acc_max), accuracy + 2)
+            if int(round(new_acc)) <= int(round(accuracy)):
                 break
-            new_wp = need + 3       # 3 digits of headroom so we don't redo again at once
-            if verbose:    # show the provisional guess so a redo isn't a silent wait
-                print(f"   provisional guess: L-point=({mpmath.nstr(center[0], 12)}, "
-                      f"{mpmath.nstr(center[1], 12)})  box size={mpmath.nstr(boxsize, 2)}")
-                print(f"   (redo: wp {wp} < accuracy+log10(cond)+{GUARD_DIGITS} = {need}"
-                      f" -> raising wp to {new_wp})")
-            wp = new_wp
+            if verbose:
+                print(f"   determination +-{mpmath.nstr(spread, 2)} > box "
+                      f"{mpmath.nstr(boxsize, 2)}; raising accuracy "
+                      f"{int(round(accuracy))} -> {int(round(new_acc))}")
+            prev_spread = spread
+            accuracy = new_acc
         cloud_prec = estimate_cloud_precision(bs)
         det_res = max((s["det_res"] for s in bs["sols"] if s), default=mpf(0))
         sol = _average_solution(bs["sols"])
@@ -1691,22 +1725,13 @@ def _search_cli(argv):
                                   -1j * (mpf(pt[0]) + mpf(pt[1]))],
         nu_from_point=lambda pt: [])
     eg = mpc(complex(a.epsilon.replace(" ", "")))
-    guess = _parse_coeffs(a.coeffs)
+    guess = _parse_coeffs(a.coeffs)     # given coefficients are KEPT; the rest randomized
     t0 = time.time()
-    if guess is not None:
-        # warm start: refine directly from the supplied coefficients at the given point
-        res = search(land, GL3_EULER, (l1, l2), mpf(a.boxsize), a.accuracy,
-                     a.working_precision, mpf(a.target), guess=guess, eps_guess=eg,
-                     max_iter=a.max_iter, wander_dist=mpf(a.wander_dist),
-                     timeout=a.timeout, verbose=True)
-        res["secs"] = time.time() - t0
-        results = [res]
-    else:
-        results = search_landscape(
-            land, GL3_EULER, (l1, l2), mpf(a.boxsize), a.accuracy, a.working_precision,
-            mpf(a.target), restarts=a.restarts, eps_guess=eg,
-            max_iter=a.max_iter, wander_dist=mpf(a.wander_dist), timeout=a.timeout,
-            verbose=True)
+    results = search_landscape(
+        land, GL3_EULER, (l1, l2), mpf(a.boxsize), a.accuracy, a.working_precision,
+        mpf(a.target), restarts=a.restarts, guess=guess, eps_guess=eg,
+        max_iter=a.max_iter, wander_dist=mpf(a.wander_dist), timeout=a.timeout,
+        verbose=True)
     elapsed = time.time() - t0
 
     blocks = []
