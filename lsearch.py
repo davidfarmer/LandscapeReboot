@@ -1136,11 +1136,38 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
     Broyden restarts), then refine EACH distinct candidate into an L-point.  The time
     limit guards only the exploration; refinement of a real candidate runs to completion.
     If `guess` is given (some starting coefficients) it is kept across the random restarts
-    and only the remaining coefficients are randomized.  Returns a list of result dicts
-    (one per candidate refined), each with 'secs'."""
+    and only the remaining coefficients are randomized.  If `guess` already covers all the
+    significant primes (a full RESUME), the random exploration is skipped entirely and the
+    point is refined directly -- exploration there is pointless and its time limit would
+    otherwise expire during the (slow, high-accuracy) builds before any solve.  Returns a
+    list of result dicts (one per candidate refined), each with 'secs'."""
     explore_acc = int(round(mpf(accuracy)))
     explore_wp = max(int(working_precision), 2 * explore_acc + 20)
     deadline = (time.time() + timeout) if timeout else None
+
+    # Full resume: the supplied coefficients already cover the significant primes -> just
+    # refine from (point, guess); the box shrinks at once so the time limit is lifted and
+    # the (possibly long) high-accuracy refinement runs to completion.
+    if guess is not None:
+        mp.dps = explore_wp
+        sys0 = build_equation_system(landscape, euler, point, explore_acc, explore_wp)
+        # full resume if the guess covers (all but at most one of) the significant primes
+        if sys0.primes and len(set(sys0.primes) - set(guess)) <= 1:
+            if verbose:
+                print("  resume: all significant primes supplied -> refining directly "
+                      "(no random exploration, no time limit)")
+            t0 = time.time()
+            # no time limit on a resume: the point is a known L-function, so the limit
+            # (which exists to abandon hopeless far points) does not apply; max_iter bounds
+            # it, and the high-accuracy climb to a fine target can take a while
+            res = search(landscape, euler, point, boxsize, accuracy, working_precision,
+                         target_box, guess=guess, eps_guess=eps_guess, max_iter=max_iter,
+                         wander_dist=wander_dist, timeout=None,
+                         refine_coeffs=refine_coeffs, verbose=verbose)
+            res["secs"] = time.time() - t0
+            res["candidate"] = 0
+            return [res]
+
     cands = explore_candidates(landscape, euler, point, boxsize, explore_acc, explore_wp,
                                restarts=restarts, guess=guess, eps_guess=eps_guess,
                                coeff_tol=coeff_tol, max_candidates=max_candidates,
