@@ -1230,6 +1230,8 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
     acc_max = _acc_max_for_target(target, ln10)   # cap accuracy at what the target needs
     stalls = 0
     refining = False             # cheap exploration until the box first shrinks
+    accuracy = acc_floor         # current accuracy, carried across iterations (monotonic)
+    prev_det = None              # last iteration's determination (cloud spread)
     last = None                  # last accepted (center, new_box, wp, cloud_prec, sol)
     deadline = (time.time() + timeout) if timeout else None
 
@@ -1242,67 +1244,43 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
         if _timed_out():         # ran out of wall-clock time without a solution
             return {"status": "timeout", "reason": "time limit", "iter": it,
                     **(last or {"point": point})}
-        # Cheap exploration vs refinement.  Until the box has actually shrunk once (a
-        # candidate is homing in) we EXPLORE at the accuracy floor: this keeps the
-        # (atomic, uninterruptible) build cheap, so a far-from-anything point is judged
-        # and abandoned in minutes instead of grinding for hours on big-M builds.  Only
-        # after a shrink do we couple accuracy to the box and refine in earnest.
+        # Accuracy is monotonic across iterations.  In refinement it is at least what the
+        # box needs; the stall logic below raises it further (coupled to the
+        # DETERMINATION, not just the box) when the determination is still improving.
         if refining:
-            accuracy = _accuracy_for_box(boxsize, acc_floor, acc_max, ln10)
-        else:
-            accuracy = acc_floor
+            accuracy = max(accuracy,
+                           _accuracy_for_box(boxsize, acc_floor, acc_max, ln10))
+        wp = max(wp, int(mpmath.ceil(accuracy)) + 6)
 
-        # Box step with two coupled guards, each of which redoes the step:
-        #  - precision guard (inner): wp >= accuracy + log10(cond) + GUARD_DIGITS, since a
-        #    cloud point's round-off and its genuine spread share the near-parallel
-        #    amplification;
-        #  - accuracy guard (outer): the determination (cloud spread) must fit INSIDE the
-        #    box, or the box can never shrink.  If it does not, RAISE the accuracy and
-        #    redo -- but only while raising accuracy keeps shrinking the determination, so
-        #    a coarse genuine candidate refines while a non-L-point (where more accuracy
-        #    does not help) is abandoned quickly.
-        prev_spread = None
-        while True:
-            wp = max(wp, int(mpmath.ceil(accuracy)) + 6)
-            for attempt in range(6):
-                if _timed_out():     # don't start another (re)build past the deadline
-                    return {"status": "timeout", "reason": "time limit", "iter": it,
-                            **(last or {"point": point})}
-                mp.dps = wp
-                bs = box_step(landscape, euler, point, boxsize, int(round(accuracy)), wp,
-                              guess=g, eps_guess=eg, solver=solver,
-                              deadline=(None if refining else deadline), verbose=False)
-                if _timed_out():
-                    return {"status": "timeout", "reason": "time limit", "iter": it,
-                            **(last or {"point": point})}
-                if bs is None or not bs["cloud"]:
-                    return {"status": "fail", "reason": "no solution", "iter": it}
-                cond = bs["cond_solve"]
-                center, spread = cloud_center_spread(bs["cloud"])
-                new_box = min(spread * mpf("1.2"), boxsize)
-                need = int(mpmath.ceil(accuracy + mpmath.log(cond) / ln10 + GUARD_DIGITS))
-                if wp >= need:
-                    break
-                new_wp = need + 3   # 3 digits of headroom so we don't redo again at once
-                if verbose:    # show the provisional guess so a redo isn't a silent wait
-                    print(f"   provisional guess: L-point=({mpmath.nstr(center[0], 12)}, "
-                          f"{mpmath.nstr(center[1], 12)})  box size={mpmath.nstr(boxsize, 2)}")
-                    print(f"   (redo: wp {wp} < accuracy+log10(cond)+{GUARD_DIGITS} = "
-                          f"{need} -> raising wp to {new_wp})")
-                wp = new_wp
-            if new_box < boxsize or int(round(accuracy)) >= acc_max:
-                break               # determination fits the box, or accuracy maxed out
-            if prev_spread is not None and spread > prev_spread * stall_factor:
-                break               # raising accuracy isn't shrinking it -> not a form
-            new_acc = min(mpf(acc_max), accuracy + 2)
-            if int(round(new_acc)) <= int(round(accuracy)):
+        # one box step per iteration (the centre RECENTERS each iteration, so it can walk
+        # toward a form), with the precision guard redoing it until
+        # wp >= accuracy + log10(cond) + GUARD_DIGITS
+        for attempt in range(6):
+            if _timed_out():
+                return {"status": "timeout", "reason": "time limit", "iter": it,
+                        **(last or {"point": point})}
+            mp.dps = wp
+            bs = box_step(landscape, euler, point, boxsize, int(round(accuracy)), wp,
+                          guess=g, eps_guess=eg, solver=solver,
+                          deadline=(None if refining else deadline), verbose=False)
+            if _timed_out():
+                return {"status": "timeout", "reason": "time limit", "iter": it,
+                        **(last or {"point": point})}
+            if bs is None or not bs["cloud"]:
+                return {"status": "fail", "reason": "no solution", "iter": it}
+            cond = bs["cond_solve"]
+            center, spread = cloud_center_spread(bs["cloud"])
+            new_box = min(spread * mpf("1.2"), boxsize)
+            need = int(mpmath.ceil(accuracy + mpmath.log(cond) / ln10 + GUARD_DIGITS))
+            if wp >= need:
                 break
-            if verbose:
-                print(f"   determination +-{mpmath.nstr(spread, 2)} > box "
-                      f"{mpmath.nstr(boxsize, 2)}; raising accuracy "
-                      f"{int(round(accuracy))} -> {int(round(new_acc))}")
-            prev_spread = spread
-            accuracy = new_acc
+            new_wp = need + 3       # 3 digits of headroom so we don't redo again at once
+            if verbose:    # show the provisional guess so a redo isn't a silent wait
+                print(f"   provisional guess: L-point=({mpmath.nstr(center[0], 12)}, "
+                      f"{mpmath.nstr(center[1], 12)})  box size={mpmath.nstr(boxsize, 2)}")
+                print(f"   (redo: wp {wp} < accuracy+log10(cond)+{GUARD_DIGITS} = "
+                      f"{need} -> raising wp to {new_wp})")
+            wp = new_wp
         cloud_prec = estimate_cloud_precision(bs)
         det_res = max((s["det_res"] for s in bs["sols"] if s), default=mpf(0))
         sol = _average_solution(bs["sols"])
@@ -1311,9 +1289,7 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
                               boxsize, cond, sol, det_res)
 
         # Wander check: give up if the cloud centre has drifted more than an ABSOLUTE
-        # distance wander_dist from the grid point we started at.  Absolute (not box-
-        # relative) so a search can begin on a grid much coarser than the box and still
-        # follow the detectors to a nearby L-function, abandoning only genuine runaways.
+        # distance wander_dist from the grid point we started at.
         if max(abs(center[0] - start[0]), abs(center[1] - start[1])) > wander_dist:
             return {"status": "fail", "reason": "wandered", "iter": it, "point": center,
                     "box": new_box}
@@ -1326,29 +1302,39 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
             return _finalize_coeffs({"status": "success", **last},
                                     landscape, euler, refine_coeffs, verbose)
 
-        # Stall detection: the box stopped shrinking meaningfully -> the detector floor
-        # has been reached; report the converged point at the achievable precision.
-        # A meaningful shrink is also the signal that a real candidate is here, so we
-        # switch from cheap exploration to full-accuracy refinement.
-        if new_box > stall_factor * boxsize:
-            stalls += 1
-            if stalls >= stall_patience:
-                return _finalize_coeffs(
-                    {"status": "converged", "reason": "detector floor", **last},
-                    landscape, euler, refine_coeffs, verbose)
-        else:
+        # Progress logic (recenter every iteration -- handled at the bottom):
+        if new_box < boxsize * stall_factor:
+            # box shrank -> a real candidate is homing in; refine in earnest
             stalls = 0
             if not refining:
                 refining = True
                 if verbose:
                     print("   (box shrank -> switching from exploration to refinement)")
+            if verbose:
+                print(f"   box size decreased: {mpmath.nstr(boxsize, 2)} -> "
+                      f"{mpmath.nstr(new_box, 2)}")
+        elif (prev_det is None or spread < prev_det * stall_factor) and \
+                int(round(accuracy)) < acc_max:
+            # box did not shrink, but the determination is still improving and there is
+            # room to raise accuracy -> couple accuracy to the determination (carried to
+            # the next iteration), recenter and try again instead of giving up
+            accuracy = min(mpf(acc_max), accuracy + 2)
+            stalls = 0
+            if verbose:
+                print(f"   determination +-{mpmath.nstr(spread, 2)} not yet inside box "
+                      f"{mpmath.nstr(boxsize, 2)}; raising accuracy to "
+                      f"{int(round(accuracy))}")
+        else:
+            # not shrinking and not improving (or accuracy maxed) -> detector floor
+            stalls += 1
+            if stalls >= stall_patience:
+                return _finalize_coeffs(
+                    {"status": "converged", "reason": "detector floor", **last},
+                    landscape, euler, refine_coeffs, verbose)
 
-        if verbose and new_box < boxsize:
-            print(f"   box size decreased: {mpmath.nstr(boxsize, 2)} -> "
-                  f"{mpmath.nstr(new_box, 2)}")
-        avg = last["sol"]
-        g, eg = avg["ap"], avg["epsilon"]
-        point, boxsize = center, new_box
+        prev_det = spread
+        g, eg = sol["ap"], sol["epsilon"]
+        point, boxsize = center, new_box        # recenter every iteration
     return {"status": "fail", "reason": "max_iter",
             **(last or {"point": point}), "iter": it}
 
