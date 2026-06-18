@@ -1077,7 +1077,9 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
     deadline = (time.time() + timeout) if timeout else None
 
     def _timed_out():
-        return deadline is not None and time.time() > deadline
+        # the time limit only guards the search for an INITIAL solution; once the box has
+        # shrunk (refining), a genuine candidate is being polished -- never abandon it
+        return deadline is not None and not refining and time.time() > deadline
 
     for it in range(max_iter):
         if _timed_out():         # ran out of wall-clock time without a solution
@@ -1104,8 +1106,8 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
                         **(last or {"point": point})}
             mp.dps = wp
             bs = box_step(landscape, euler, point, boxsize, int(round(accuracy)), wp,
-                          guess=g, eps_guess=eg, solver=solver, deadline=deadline,
-                          verbose=False)
+                          guess=g, eps_guess=eg, solver=solver,
+                          deadline=(None if refining else deadline), verbose=False)
             if _timed_out():
                 return {"status": "timeout", "reason": "time limit", "iter": it,
                         **(last or {"point": point})}
