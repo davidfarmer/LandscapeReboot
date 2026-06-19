@@ -1168,10 +1168,17 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
             res["candidate"] = 0
             return [res]
 
+    # When some coefficients are supplied (a partial resume / known-point context), lift
+    # the time limit: the slow high-accuracy builds would otherwise expire it before any
+    # random start is tried.  The limit exists to abandon hopeless FAR points, which does
+    # not apply once the caller has given a point + partial coefficients.
+    explore_deadline = None if guess is not None else deadline
+    refine_timeout = None if guess is not None else timeout
+
     cands = explore_candidates(landscape, euler, point, boxsize, explore_acc, explore_wp,
                                restarts=restarts, guess=guess, eps_guess=eps_guess,
                                coeff_tol=coeff_tol, max_candidates=max_candidates,
-                               deadline=deadline, verbose=verbose)
+                               deadline=explore_deadline, verbose=verbose)
     results = []
     for n, cand in enumerate(cands):
         if verbose:
@@ -1181,7 +1188,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
         res = search(landscape, euler, cand["center"], boxsize, accuracy,
                      working_precision, target_box, guess=cand["ap"],
                      eps_guess=cand["epsilon"], max_iter=max_iter,
-                     wander_dist=wander_dist, timeout=timeout,
+                     wander_dist=wander_dist, timeout=refine_timeout,
                      refine_coeffs=refine_coeffs, verbose=verbose)
         res["secs"] = time.time() - t0
         res["candidate"] = n
