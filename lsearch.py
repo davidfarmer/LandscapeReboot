@@ -1581,6 +1581,15 @@ def selftest_m4(accuracy=8, working_precision=30, verbose=True):
     return ok
 
 
+def _fmt_complex(z, digits):
+    """Format a complex number as 're+imj' / 're-imj' (no spaces or parentheses) to
+    `digits` significant figures -- the form the --coeffs parser accepts."""
+    z = mpc(z)
+    re = mpmath.nstr(mpmath.re(z), digits)
+    im = mpmath.im(z)
+    return re + ("+" if im >= 0 else "-") + mpmath.nstr(abs(im), digits) + "j"
+
+
 def _search_report(res, land, a, elapsed):
     """Build the human-readable result block for a command-line search: classify the
     outcome (wandered / box-did-not-decrease / partial / success), report the running
@@ -1669,7 +1678,15 @@ def _search_report(res, land, a, elapsed):
                    % (nstr(pt[0], 20), nstr(pt[1], 20), land.conductor))
         out.append("    --boxsize %s --accuracy %d --working-precision %d \\"
                    % (nstr(box, 4), r_acc, r_wp))
-        out.append("    --target %s --epsilon 1 --max-iter 12" % nstr(r_target, 2))
+        out.append("    --target %s --epsilon 1 --max-iter 12 \\" % nstr(r_target, 2))
+        # include the recovered coefficients so this is a copy-paste resume; quoted
+        # because the values contain '+'/spaces, and the leading '-' needs the = form
+        if sol:
+            cdig = digits(box) + 6
+            cs = ",".join(_fmt_complex(sol["ap"][p], cdig) for p in sol["primes"])
+            out.append('    --coeffs="%s"' % cs)
+        else:
+            out.append("    --coeffs=...")
 
     out.append("=" * 68)
     return "\n".join(out)
