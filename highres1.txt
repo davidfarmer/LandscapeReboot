@@ -1,0 +1,39 @@
+
+FOUND 1 candidate(s); 1 refined to an L-point. total time 37247.6 s.
+
+CANDIDATE 0:
+====================================================================
+SEARCH RESULT   landscape: GL(3) degree 3, conductor 1
+start point: 14.141635588127451714,2.3803884888122250825    initial box: 5.6e-14    target: 5.6e-20
+iterations done: 3    running time: 37036.6 s
+point found: l1 = 14.1416355881274517 ,  l2 = 2.38038848881222505
+OUTCOME: SUCCESS -- the box reached the target (5.6e-20).
+spectral parameters determined to +- 3.2e-25  (about 24 digits).
+numerical precision of the cloud points: 6.9e-49.
+accuracy used: 27 digits;  working precision: 72 digits.
+coefficient least-squares fit residual: 2.8e-25.
+sign epsilon = (1.0 + 1.94705708193e-25j)
+  a_2   = (-0.105240971345 + 0.75072694437j)
+  a_3   = (1.23599391514 - 0.0391121733259j)
+  a_5   = (0.134570999785 + 0.154625091754j)
+  a_7   = (-0.900953517139 - 0.477881432632j)
+  a_11  = (0.690303087061 - 0.382679918712j)
+  a_13  = (-0.234939747309 - 0.0235896510071j)
+  a_17  = (-0.506880282228 - 0.533232723967j)
+  a_19  = (1.11123272879 - 0.0344392010407j)
+  a_23  = (0.48529342724 + 0.382404277184j)
+  a_29  = (-0.606456268587 + 0.652490084754j)
+  a_31  = (0.00519615997431 - 0.00750631702584j)
+  a_37  = (-0.646092124061 - 0.106085781333j)
+  a_41  = (0.151087822135 + 0.285449236009j)
+  a_43  = (0.386016276646 - 0.757154486264j)
+  a_47  = (-0.836444116497 - 0.416451162368j)
+  a_53  = (-0.271009116999 + 0.140262743112j)
+  a_59  = (-0.341408004565 - 3.48584388531j)
+  a_61  = (0.275106273156 + 8.58249021978j)
+
+To refine further, run:
+  python3 lsearch.py search --point=14.141635588127451673,2.3803884888122250513 --conductor 1 \
+    --boxsize 3.197e-25 --accuracy 27 --working-precision 82 \
+    --target 3.2e-28 --epsilon 1 --max-iter 12
+====================================================================

@@ -24,10 +24,23 @@ If you read nothing else, read **§3 (mental model)**, **§6 (hard-won knowledge
   landscape. This is the newer work and is **not** covered by `README.md` — only by
   docstrings and this file.
 
-Backups (`*_backup.py`, `README_backup.md`) are old snapshots; ignore them.
+- **`examples.txt`** — ready-to-run command lines for both `afe.py` and `lsearch.py`
+  (symbolic/numeric evaluation, cold search, discovery, warm-start, resume, self-tests).
+  Start here to see the tools in action.
+
+Backups (`*_backup.py`, `README_backup.md`) are old snapshots; ignore them. Files like
+`testfile1.txt`, `highres1.txt` are search-result logs (from `--append`), not source.
 
 Everything runs in **mpmath** arbitrary precision. `mp.dps` (decimal digits) is set
 explicitly by the search; don't assume the default.
+
+> **Heads-up (planned reorganization).** As of this writing the search and CLI are still
+> specialized to the degree-3, GL(3) landscape (`gl3_*`, `GL3_*`, a hardcoded Γ-map in the
+> CLI). A reorganization is planned to make adding other landscapes (other degrees, Γ-shapes,
+> conductors, Euler products) easy: push everything behind the `Landscape`/`EulerProduct`
+> abstractions plus a `Family` registry, so the engine becomes family-agnostic and the CLI
+> takes `--family`. If the code you're reading already has that, this file's GL(3)-specific
+> names may be out of date; the *concepts* below still hold.
 
 ---
 
@@ -84,6 +97,40 @@ current accuracy), or `fail`/`wandered` otherwise.
 > Geometric subtlety worth internalizing: the cloud concentrates wherever the detector
 > zero-lines *intersect*, which happens even where **no** L-function exists. Concentration
 > alone does not prove a form (see §6, "candidate → confirm").
+
+---
+
+## 3a. Running a search: cold, warm, resume (the CLI)
+
+The command-line entry point is the `search` subcommand (see `examples.txt`):
+
+```
+python3 lsearch.py search --point=l1,l2 --conductor N --boxsize B --accuracy A \
+    --working-precision W --target T --max-iter K [--coeffs="..."] [--restarts R] \
+    [--timeout S] [--wander-dist D] [--append FILE]
+```
+
+It is driven by **`search_landscape`**, which orchestrates explore-then-refine and has two
+modes depending on `--coeffs`:
+
+- **Cold / partial → exploration.** With no (or only some) coefficients, `explore_candidates`
+  searches near the point: it **varies the number of coefficients k** and tries `--restarts`
+  (default 20) **random Broyden starts**, keeping any supplied coefficients fixed and
+  randomizing the rest. The resulting solutions are **de-duplicated by their COEFFICIENT
+  vectors** (weighted toward small primes — `_coeff_distance`), so two *distinct* L-functions
+  that share a (near-)identical spectral point are kept apart. Each distinct candidate is then
+  refined separately by `search`. This is what extends reach (§6).
+- **Full resume → direct refine.** If `--coeffs` covers all the significant primes, exploration
+  is skipped and the point is refined directly from (point, coefficients), with the **time limit
+  lifted** (the point is a known L-function). The "To refine further" command that a successful
+  run prints is exactly such a resume — it includes `--coeffs` at the recovered precision, so you
+  can paste it to push to a finer target.
+
+Shell/argparse gotcha: a `--point` or `--coeffs` value that starts with `-` (or contains
+`(`,`+`) must use the `=` form and quotes: `--point=-16.4,-0.17`, `--coeffs="-0.1+0.7j,..."`.
+
+`search` itself (the single-candidate refiner) is also callable directly from Python (§8); it
+returns a status dict. `search_landscape` returns a *list* of result dicts (one per candidate).
 
 ---
 
@@ -199,6 +246,36 @@ cloud center may drift from the starting point. It is absolute (not box-relative
 can start on a grid much coarser than the box and still let the detectors pull you to a
 nearby form, abandoning only genuine runaways.
 
+**Reach is limited by COEFFICIENTS, not by the geometry.** A *cold* search (no
+coefficients) reliably homes in only from ~a few × the box (≈1e-3): farther out, the cold
+square-solve from `a_p = 0` lands on garbage and the cloud points *away* from the form
+(measured: from 0.08 away the cold center landed 0.10 away). What extends reach is good
+coefficients — warm-started with a nearby form's `a_p` (or via random restarts that happen
+to find them), iteration 0 lands ~0.01 from a form 0.08 away, within homing range. So to
+scan widely, use many `--restarts`, or propagate coefficients from solved neighbours.
+Two effects compound: **more coefficients** (forcing higher k, which the QR/conditioning
+allows) and **random restarts** to escape the cold-guess basin.
+
+**Accuracy is coupled to the determination, not just the box, per iteration.** When the
+cloud spread (determination) exceeds the box the box cannot shrink; the loop then RAISES
+accuracy and recenters *each iteration*, but only while raising accuracy keeps shrinking
+the determination — so a coarse genuine candidate refines, while a non-form (more accuracy
+doesn't help) is abandoned. This is *necessary*: the determination is detector-floor-limited,
+so recentering alone bottoms out at the accuracy floor; only more accuracy goes below it.
+(Implementation note: the raise is per-iteration with accuracy carried forward — an earlier
+within-iteration while-loop trapped the center without recentering and was much slower.)
+
+**The time limit guards only the search for an INITIAL solution.** `--timeout` bounds the
+exploration / pre-shrink phase (to abandon hopeless far points fast). Once the box shrinks
+(a real candidate is homing in) — or whenever coefficients are supplied (a known point) —
+the limit is lifted, so the (slow, high-accuracy) refinement runs to completion. A far
+point like (10, 8.8) still bails in minutes; a resume runs as long as it needs.
+
+**Output precision tracks what's known.** λ (and the refine command's `--point`) is shown to
+(determined digits)+3; coefficients (and `--coeffs`) to (least-squares fit residual digits)+3.
+So no spurious digits beyond the determination, and the resume command carries exactly the
+trustworthy precision plus a 3-digit guard.
+
 ---
 
 ## 7. Practical gotchas
@@ -226,6 +303,14 @@ nearby form, abandoning only genuine runaways.
 python3 lsearch.py m3        # solve recovers coefficients, rejects off-points
 python3 lsearch.py m4        # box step: cloud concentrates toward the truth
 python3 afe.py               # validates the analytic engine vs ζ, Dirichlet L, etc.
+
+# a command-line search (cold) -- see examples.txt for discovery / warm / resume:
+python3 lsearch.py search --point "14.14,2.4" --conductor 1 \
+        --boxsize 1e-3 --accuracy 8 --working-precision 30 --target 1e-6 --epsilon 1
+# resume from known coefficients (a successful run prints exactly such a command):
+python3 lsearch.py search --point=14.1416,2.3804 --conductor 1 --boxsize 1e-6 \
+        --accuracy 12 --working-precision 40 --target 1e-9 --epsilon 1 \
+        --coeffs="-0.1052+0.7507j,1.236-0.0391j,0.1346+0.1546j,-0.901-0.4779j"
 ```
 
 ```python
@@ -258,8 +343,10 @@ working precision, box size, condition number, detector residual, and primes use
 | build equations | `build_equation_system`, `residual`, `coefficient_relation_grid` (in afe) |
 | equation selection | `_select_rows`, `_select_from_jacobian`, `_equation_jacobian` |
 | solve | `solve_at_point` (square), `solve_at_point_lsq` / `_lsq_core` (least-squares) |
-| geometry | `box_step`, `triangle_corners`, `cloud_center_spread`, `estimate_cloud_precision` |
-| loop | `search`, `_accuracy_for_box`, `_acc_max_for_target`, `_finalize_coeffs` |
+| geometry | `box_step`, `triangle_corners`, `_cloud_from_corners`, `cloud_center_spread`, `estimate_cloud_precision` |
+| single-candidate loop | `search`, `_accuracy_for_box`, `_acc_max_for_target`, `_finalize_coeffs` |
+| multi-candidate / reach | `search_landscape`, `explore_candidates`, `_random_ap`, `_coeff_distance` |
+| CLI + reporting | `_search_cli`, `_parse_coeffs`, `_search_report`, `_fmt_complex` |
 | constants | `FIXED_S`, `ACC_OVER`, `ACC_MARGIN`, `GUARD_DIGITS` |
 
 The git history is a good narrative: commits are milestone- and finding-shaped
