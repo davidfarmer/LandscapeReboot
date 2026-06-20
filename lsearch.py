@@ -985,9 +985,12 @@ def _report_iteration(it, center, spread, cloud_prec, accuracy, wp, boxsize,
     """Per-iteration progress report while refining a point: the current spectral
     parameters and how well they are pinned down, the recovered Euler coefficients and
     the sign, and the accuracy/precision parameters driving the search."""
-    # how many decimal places of lambda are actually determined (by the cloud spread)
-    det_digits = int(max(0, -mpmath.log(spread) / mpmath.log(10))) if spread else 0
-    show = det_digits + 6           # determined digits plus a few to watch them settle
+    # show lambda to 3 digits beyond the determined accuracy (the cloud spread), and the
+    # coefficients to 3 digits beyond the detector residual (the per-iteration analog of
+    # the least-squares fit residual)
+    ln10 = mpmath.log(10)
+    show = int(max(0, -mpmath.log(spread) / ln10)) + 3 if spread else 16
+    cdig = int(max(0, -mpmath.log(det_res) / ln10)) + 3 if det_res and det_res > 0 else show
     print(f"  ---- iteration {it} " + "-" * 40)
     # current best guess of the L-point coordinates and the box being searched
     print(f"  current guess: L-point = ({mpmath.nstr(center[0], show)}, "
@@ -1005,7 +1008,7 @@ def _report_iteration(it, center, spread, cloud_prec, accuracy, wp, boxsize,
           f"   primes used = {len(sol['primes'])}")
     print(f"  Euler coefficients a_p:")
     for p in sol["primes"]:
-        print(f"      a_{p:<3d}= {mpmath.nstr(sol['ap'][p], 12)}")
+        print(f"      a_{p:<3d}= {mpmath.nstr(sol['ap'][p], cdig)}")
 
 
 def _random_ap(primes, scale, fixed=None):
@@ -1609,6 +1612,8 @@ def _search_report(res, land, a, elapsed):
     reason = res.get("reason", "")
     box = res.get("box")
     pt = res.get("point")
+    # show the L-point to 3 digits beyond the determined accuracy (the box)
+    lam_dig = (digits(box) + 3) if (box and box > 0) else 16
 
     out = ["=" * 68]
     out.append("SEARCH RESULT   landscape: %s" % land.name)
@@ -1618,7 +1623,8 @@ def _search_report(res, land, a, elapsed):
     out.append("iterations done: %s    running time: %.1f s"
                % ("?" if iters is None else iters + 1, elapsed))
     if pt is not None:
-        out.append("point found: l1 = %s ,  l2 = %s" % (nstr(pt[0], 18), nstr(pt[1], 18)))
+        out.append("point found: l1 = %s ,  l2 = %s"
+                   % (nstr(pt[0], lam_dig), nstr(pt[1], lam_dig)))
 
     # ---- classify the outcome ------------------------------------------------
     if status == "success":
@@ -1663,11 +1669,13 @@ def _search_report(res, land, a, elapsed):
         cfr = res.get("coeff_fit_res")
         if cfr is not None:
             out.append("coefficient least-squares fit residual: %s." % nstr(cfr, 2))
+        # show coefficients to 3 digits beyond the least-squares fit residual
+        coef_dig = (digits(cfr) + 3) if (cfr and cfr > 0) else lam_dig
         sol = res.get("sol")
         if sol:
-            out.append("sign epsilon = %s" % nstr(sol["epsilon"], 12))
+            out.append("sign epsilon = %s" % nstr(sol["epsilon"], coef_dig))
             for pp in sol["primes"]:
-                out.append("  a_%-3d = %s" % (pp, nstr(sol["ap"][pp], 12)))
+                out.append("  a_%-3d = %s" % (pp, nstr(sol["ap"][pp], coef_dig)))
         # finer target: push 3 orders past a success, retry the original on a partial
         r_target = box * mpf("1e-3") if kind == "success" else target
         r_wp = res.get("wp", a.working_precision) + 10
@@ -1675,15 +1683,14 @@ def _search_report(res, land, a, elapsed):
         out.append("")
         out.append("To refine further, run:")
         out.append("  python3 lsearch.py search --point=%s,%s --conductor %d \\"
-                   % (nstr(pt[0], 20), nstr(pt[1], 20), land.conductor))
+                   % (nstr(pt[0], lam_dig), nstr(pt[1], lam_dig), land.conductor))
         out.append("    --boxsize %s --accuracy %d --working-precision %d \\"
                    % (nstr(box, 4), r_acc, r_wp))
         out.append("    --target %s --epsilon 1 --max-iter 12 \\" % nstr(r_target, 2))
         # include the recovered coefficients so this is a copy-paste resume; quoted
         # because the values contain '+'/spaces, and the leading '-' needs the = form
         if sol:
-            cdig = digits(box) + 6
-            cs = ",".join(_fmt_complex(sol["ap"][p], cdig) for p in sol["primes"])
+            cs = ",".join(_fmt_complex(sol["ap"][p], coef_dig) for p in sol["primes"])
             out.append('    --coeffs="%s"' % cs)
         else:
             out.append("    --coeffs=...")
