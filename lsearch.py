@@ -24,14 +24,19 @@ with Gamma factors
 Its ground truth is the GL(3) Maass form already stored in afe.py (GL3_MAASS), whose
 spectral parameters are (lambda1, lambda2) = (-16.40312474..., -0.17112189...).
 
+The landscapes themselves (the Gamma factors, conductor, central character and the
+good-prime Euler-factor model) live in families.py and are loaded from the plain-text
+registry landscapes.txt; this file is the family-agnostic engine that searches them.
+
 Conventions fixed for the whole search (per the project design):
-  * All unknowns and equations are real: a_p -> (Re a_p, Im a_p); a complex
-    equation -> its (Re, Im) pair.
-  * Two real unknowns per prime.  For a tempered degree-3 form with trivial
-    central character the Satake roots lie on the unit circle with product 1, so
-    the local factor is  1 - a_p X + conj(a_p) X^2 - X^3  and every higher
-    coefficient is determined by a_p:
+  * All unknowns and equations are real: each complex local unknown -> (Re, Im); a
+    complex equation -> its (Re, Im) pair.
+  * Each prime carries `euler.complex_unknowns_per_prime` complex local unknowns
+    (the first few Dirichlet coefficients b(p), b(p^2), ...), so a per-prime unknown
+    is a LIST.  For a tempered degree-3 form with trivial central character that is
+    the single a_p = b(p): the local factor is 1 - a_p X + conj(a_p) X^2 - X^3 with
         b(p^k) = a_p b(p^{k-1}) - conj(a_p) b(p^{k-2}) + b(p^{k-3}),   b(p^0)=1.
+    The Euler algebra (families.euler_self_reciprocal) generalizes this to any degree.
   * The sign epsilon is itself unknown, carried as (epsR, epsI) with the extra
     equation epsR^2 + epsI^2 = 1.
   * Equations come from the list of weight functions (not from varying a point s);
@@ -51,159 +56,16 @@ from mpmath import mp, mpf, mpc
 
 from afe import (coefficient_relation, coefficient_relation_grid,
                  GL3_MAASS, gl3_maass_bcoeffs)
+from families import (Landscape, EulerProduct, KnownTarget, Family,
+                      primes_up_to, prime_pi, _smallest_prime_factor_table,
+                      get_family, gl3_known_target, GL3_LANDSCAPE, GL3_EULER)
 
 # The fixed evaluation point for every coefficient_relation call (symmetry point).
 FIXED_S = mpf(1) / 2
 
 
-# ---------------------------------------------------------------------------
-# Prime helpers
-# ---------------------------------------------------------------------------
-
-def primes_up_to(M):
-    """List of primes <= M."""
-    M = int(M)
-    if M < 2:
-        return []
-    sieve = bytearray([1]) * (M + 1)
-    sieve[0] = sieve[1] = 0
-    for i in range(2, int(M ** 0.5) + 1):
-        if sieve[i]:
-            sieve[i * i::i] = bytearray(len(sieve[i * i::i]))
-    return [i for i in range(2, M + 1) if sieve[i]]
-
-
-def prime_pi(M):
-    """Number of primes <= M."""
-    return len(primes_up_to(M))
-
-
-def _smallest_prime_factor_table(M):
-    spf = list(range(M + 1))
-    i = 2
-    while i * i <= M:
-        if spf[i] == i:
-            for j in range(i * i, M + 1, i):
-                if spf[j] == j:
-                    spf[j] = i
-        i += 1
-    return spf
-
-
-# ---------------------------------------------------------------------------
-# M0.  Data model
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Landscape:
-    """A functional-equation family: known conductor, Gamma factors with unknown
-    spectral parameters.  A 'point' is the tuple of spectral parameters."""
-    name: str
-    degree: int
-    conductor: int
-    dim: int                         # number of free spectral parameters
-    mu_from_point: Callable          # point -> list of Gamma_R shifts (mu)
-    nu_from_point: Callable          # point -> list of Gamma_C shifts (nu)
-
-
-@dataclass
-class EulerProduct:
-    """The Euler-product shape: how the full coefficient vector is built from the
-    independent per-prime unknowns, and how to read those unknowns back out."""
-    name: str
-    degree: int
-    real_unknowns_per_prime: int
-    bcoeffs_from_ap: Callable        # (ap: dict {p: a_p}, M) -> [b(1), ..., b(M)]
-    extract_ap: Callable             # ([b(1), ..., b(M)]) -> {p: a_p}
-
-
-@dataclass
-class KnownTarget:
-    """A fully known L-function sitting in a landscape, used as ground truth."""
-    name: str
-    landscape: Landscape
-    euler: EulerProduct
-    point: tuple                     # the true spectral parameters
-    epsilon: mpc                     # the true sign
-    ap: dict                         # the true {p: a_p}
-
-
-# ---------------------------------------------------------------------------
-# M1.  Euler-product coefficient algebra for the degree-3 tempered family
-# ---------------------------------------------------------------------------
-
-def gl3_bppow(a, k):
-    """b(p^k) for the tempered degree-3 local factor 1 - a X + conj(a) X^2 - X^3.
-
-    b(p^k) = a b(p^{k-1}) - conj(a) b(p^{k-2}) + b(p^{k-3}),  b(p^0)=1."""
-    a = mpc(a)
-    ac = mpmath.conj(a)
-    h = [mpc(1)]
-    for j in range(1, int(k) + 1):
-        hj = a * h[j - 1]
-        if j >= 2:
-            hj -= ac * h[j - 2]
-        if j >= 3:
-            hj += h[j - 3]
-        h.append(hj)
-    return h[int(k)]
-
-
-def gl3_bcoeffs_from_ap(ap, M):
-    """Full coefficient vector b(1..M) from the per-prime unknowns ap = {p: a_p}.
-
-    b(1)=1; b(p^k) by the degree-3 recurrence; composites by multiplicativity."""
-    M = int(M)
-    spf = _smallest_prime_factor_table(M)
-    b = [mpc(0)] * (M + 1)
-    if M >= 1:
-        b[1] = mpc(1)
-    for n in range(2, M + 1):
-        m, val = n, mpc(1)
-        while m > 1:
-            p = spf[m]
-            e = 0
-            while m % p == 0:
-                m //= p
-                e += 1
-            # a_p defaults to 0 for primes not among the unknowns (their coefficients
-            # are below the noise level), which drops those n from the series.
-            val *= gl3_bppow(ap.get(p, mpc(0)), e)
-        b[n] = val
-    return b[1:M + 1]
-
-
-def gl3_extract_ap(b):
-    """Read the per-prime unknowns a_p = b(p) out of a coefficient vector b(1..M)."""
-    return {p: mpc(b[p - 1]) for p in primes_up_to(len(b))}
-
-
-GL3_LANDSCAPE = Landscape(
-    name="GL(3,Z) Maass forms, conductor 1",
-    degree=3, conductor=1, dim=2,
-    mu_from_point=lambda pt: [1j * mpf(pt[0]), 1j * mpf(pt[1]),
-                              -1j * (mpf(pt[0]) + mpf(pt[1]))],
-    nu_from_point=lambda pt: [],
-)
-
-GL3_EULER = EulerProduct(
-    name="degree 3, tempered, trivial central character",
-    degree=3, real_unknowns_per_prime=2,
-    bcoeffs_from_ap=gl3_bcoeffs_from_ap, extract_ap=gl3_extract_ap,
-)
-
-
-def gl3_known_target():
-    """Ground truth: the first SL(3,Z) Maass form (LMFDB 3-1-1.1-r0e3-...), as a
-    point of GL3_LANDSCAPE with its true sign and a_p."""
-    # spectral parameters: GL3_MAASS["mu"] = [i*l1, i*l2, i*l3] with l3 = -(l1+l2)
-    lam = [mpmath.re(-1j * m) for m in GL3_MAASS["mu"]]
-    point = (lam[0], lam[1])
-    b = gl3_maass_bcoeffs(40)        # n<=40 uses primes up to 37 (all stored)
-    ap = gl3_extract_ap(b)
-    return KnownTarget(name="SL(3,Z) Maass form 3-1-1.1-r0e3-...",
-                       landscape=GL3_LANDSCAPE, euler=GL3_EULER,
-                       point=point, epsilon=mpc(1), ap=ap)
+# (Prime helpers, the Landscape/EulerProduct/KnownTarget data model, and the
+# GL(3) Euler algebra now live in families.py and are imported above.)
 
 
 # ---------------------------------------------------------------------------
@@ -296,9 +158,10 @@ def count_unknowns(euler, M):
 # M2.  Equation assembly: the real residual system R(unknowns)
 # ---------------------------------------------------------------------------
 #
-# Unknown real vector:   u = [epsR, epsI, x_p2, y_p2, x_p3, y_p3, ...]
-# with epsilon = epsR + i epsI and a_p = x_p + i y_p for each prime p <= M.
-# (b(1)=1 and the Euler product fix every other coefficient -- see M1.)
+# Unknown real vector:   u = [epsR, epsI, then for each prime p <= M its
+# complex_unknowns_per_prime local coefficients flattened to (Re, Im) pairs]
+# with epsilon = epsR + i epsI.  For GL(3) each prime carries the single a_p.
+# (b(1)=1 and the Euler product fix every other coefficient -- see families.py.)
 #
 # Each weight g gives one COMPLEX equation.  Calling coefficient_relation with
 # epsilon=1 yields A_n (coeff of b(n)) and B_n (coeff of conj(b(n)), epsilon-free
@@ -331,18 +194,27 @@ class EquationSystem:
 
 
 def pack_unknowns(epsilon, ap, primes):
-    """(epsilon, {p: a_p}) -> real vector [epsR, epsI, x_p, y_p, ...]."""
+    """(epsilon, {p: [c1, c2, ...]}) -> real vector [epsR, epsI, then each prime's
+    complex local unknowns flattened to (Re, Im) pairs].  Each prime carries
+    `euler.complex_unknowns_per_prime` complex numbers (just [a_p] for GL(3))."""
     u = [mpmath.re(epsilon), mpmath.im(epsilon)]
     for p in primes:
-        a = mpc(ap[p])
-        u += [mpmath.re(a), mpmath.im(a)]
+        for c in ap[p]:
+            c = mpc(c)
+            u += [mpmath.re(c), mpmath.im(c)]
     return u
 
 
-def unpack_unknowns(u, primes):
-    """Inverse of pack_unknowns: -> (epsilon, {p: a_p})."""
+def unpack_unknowns(u, primes, n_loc=1):
+    """Inverse of pack_unknowns: -> (epsilon, {p: [c1, ..., c_{n_loc}]})."""
     epsilon = mpc(u[0], u[1])
-    ap = {p: mpc(u[2 + 2 * k], u[2 + 2 * k + 1]) for k, p in enumerate(primes)}
+    ap, off = {}, 2
+    for p in primes:
+        vals = []
+        for _ in range(n_loc):
+            vals.append(mpc(u[off], u[off + 1]))
+            off += 2
+        ap[p] = vals
     return epsilon, ap
 
 
@@ -420,7 +292,7 @@ def residual(system, u, primes=None):
     (default system.primes); primes not in the list have a_p = 0."""
     if primes is None:
         primes = system.primes
-    epsilon, ap = unpack_unknowns(u, primes)
+    epsilon, ap = unpack_unknowns(u, primes, system.euler.complex_unknowns_per_prime)
     b = system.euler.bcoeffs_from_ap(ap, system.M)
     bconj = [mpmath.conj(x) for x in b]
     out = []
@@ -514,8 +386,9 @@ def _select_from_jacobian(jac_full, K, euler, k, n_detectors):
     normalization) and n_detectors further independent equations for k unknown primes,
     by QR row pivoting on the columns of the full equation Jacobian belonging to those
     primes.  Returns (solve_idx, det_idx)."""
-    U = 2 + euler.real_unknowns_per_prime * k
-    cols = [0, 1] + [2 + 2 * j + t for j in range(k) for t in (0, 1)]   # eps + k primes
+    rpp = euler.real_unknowns_per_prime                    # 2 * complex unknowns / prime
+    U = 2 + rpp * k
+    cols = [0, 1] + [2 + rpp * j + t for j in range(k) for t in range(rpp)]  # eps + k primes
     sub = [[row[c] for c in cols] for row in jac_full]
     sel = _select_rows(sub, (U - 1) + n_detectors)
     solve_idx = sel[:U - 1] + [2 * K]                      # + the sign normalization
@@ -533,8 +406,18 @@ def _select_from_jacobian(jac_full, K, euler, k, n_detectors):
 # start, then rank-1 secant updates -- so the Jacobian is not re-differenced every
 # step and little precision is lost.
 
-def _guess_vector(primes, guess, eps_guess):
-    ap = {p: mpc((guess or {}).get(p, 0)) for p in primes}
+def _guess_vector(primes, guess, eps_guess, n_loc=1):
+    """Pack a starting vector for `primes`, padding/truncating each supplied per-prime
+    coefficient list to n_loc entries (missing primes start at all-zero)."""
+    guess = guess or {}
+    ap = {}
+    for p in primes:
+        g = guess.get(p)
+        if g is None:
+            ap[p] = [mpc(0)] * n_loc
+        else:
+            vals = [mpc(x) for x in g][:n_loc]
+            ap[p] = vals + [mpc(0)] * (n_loc - len(vals))
     return pack_unknowns(eps_guess, ap, primes)
 
 
@@ -622,6 +505,7 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
     h = mpf(10) ** (-(system.working_precision // 3))
 
     K = len(system.A)
+    nloc = system.euler.complex_unknowns_per_prime
     if fixed is not None:           # reuse a chosen equation set at a fixed prime count
         solve_idx, det_idx, primes = fixed
         ks = [len(primes)]
@@ -632,7 +516,7 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
         ks = list(range(k_init, k_max + 1))
         # one equation Jacobian over ALL candidate primes; per-k selection reuses its
         # columns (far cheaper than re-differencing for every prime count)
-        xall = _guess_vector(cand, guess, eps_guess)
+        xall = _guess_vector(cand, guess, eps_guess, nloc)
         jac_full = _equation_jacobian(system, xall, cand, 2 * K, deadline=deadline)
 
     best = None
@@ -643,7 +527,7 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
             primes = cand[:k]
             solve_idx, det_idx = _select_from_jacobian(jac_full, K, system.euler,
                                                        k, n_detectors)
-        x0 = _guess_vector(primes, guess, eps_guess)
+        x0 = _guess_vector(primes, guess, eps_guess, nloc)
 
         def F(u, _si=solve_idx, _pr=primes):
             full = residual(system, u, primes=_pr)
@@ -669,7 +553,7 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
         if verbose:
             print(f"   k={k} primes={primes}: ||solve||={mpmath.nstr(nrm,3)}  "
                   f"||det||={mpmath.nstr(det,3)}  cond={mpmath.nstr(cond,2)}")
-        eps, ap = unpack_unknowns(x, primes)
+        eps, ap = unpack_unknowns(x, primes, nloc)
         cand_sol = {"primes": primes, "epsilon": eps, "ap": ap, "cond": cond,
                     "solve_res": nrm, "det_res": det, "x": x, "k": k,
                     "solve_idx": solve_idx, "det_idx": det_idx}
@@ -713,12 +597,13 @@ def solve_at_point_lsq(system, guess=None, eps_guess=None, k=None, n_eq=None,
     # the unknowns), chosen by QR pivoting; always include the sign normalization
     if n_eq is None:
         n_eq = min(2 * K, 4 * U)
-    x0 = _guess_vector(primes, guess, eps_guess)
+    nloc = system.euler.complex_unknowns_per_prime
+    x0 = _guess_vector(primes, guess, eps_guess, nloc)
     jac0 = _equation_jacobian(system, x0, primes, 2 * K)
     eq_idx = _select_rows(jac0, n_eq) + [norm_idx]
     x, nrm = _lsq_core(system, primes, eq_idx, x0, tol, maxiter, damping)
 
-    eps, ap = unpack_unknowns(x, primes)
+    eps, ap = unpack_unknowns(x, primes, nloc)
     full = residual(system, x, primes=primes)
     all_res = max(abs(full[i]) for i in range(2 * K))   # fit over EVERY equation
     if verbose:
@@ -874,7 +759,7 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
         tol = mpf(10) ** (-(sys0.accuracy))
         for i in range(3):
             x_ref, _ = _lsq_core(systems[i], primes, fit_idx, sols[i]["x"], tol, 30)
-            eps_r, ap_r = unpack_unknowns(x_ref, primes)
+            eps_r, ap_r = unpack_unknowns(x_ref, primes, sys0.euler.complex_unknowns_per_prime)
             sols[i] = {**sols[i], "x": x_ref, "epsilon": eps_r, "ap": ap_r}
 
     # detector zero-lines from the 3 corners, intersected pairwise into a cloud
@@ -955,7 +840,9 @@ def _average_solution(sols):
     sols = [s for s in sols if s is not None]
     primes = sols[0]["primes"]
     n = len(sols)
-    ap = {p: mpmath.fsum(s["ap"][p] for s in sols) / n for p in primes}
+    nloc = len(sols[0]["ap"][primes[0]]) if primes else 0
+    ap = {p: [mpmath.fsum(s["ap"][p][j] for s in sols) / n for j in range(nloc)]
+          for p in primes}
     eps = mpmath.fsum(s["epsilon"] for s in sols) / n
     return {"primes": primes, "ap": ap, "epsilon": eps}
 
@@ -1006,25 +893,33 @@ def _report_iteration(it, center, spread, cloud_prec, accuracy, wp, boxsize,
     print(f"  solve condition = {mpmath.nstr(cond, 3)}"
           f"   detector residual = {mpmath.nstr(det_res, 2)}"
           f"   primes used = {len(sol['primes'])}")
-    print(f"  Euler coefficients a_p:")
+    print(f"  Euler coefficients (b(p), b(p^2), ... per prime):")
     for p in sol["primes"]:
-        print(f"      a_{p:<3d}= {mpmath.nstr(sol['ap'][p], cdig)}")
+        comps = sol["ap"][p]
+        vals = ", ".join(mpmath.nstr(c, cdig) for c in comps)
+        label = f"a_{p:<3d}=" if len(comps) == 1 else f"p={p:<3d}:"
+        print(f"      {label} {vals}")
 
 
-def _random_ap(primes, scale, fixed=None):
+def _rand_c(scale):
+    return mpc(2 * scale * (mpf(random.random()) - mpf("0.5")),
+               2 * scale * (mpf(random.random()) - mpf("0.5")))
+
+
+def _random_ap(primes, scale, n_loc=1, fixed=None):
     """A random Euler-coefficient guess (uniform in the box |Re|,|Im| <= scale) used as a
     Broyden restart; different restarts find different solutions of the system.  Any
-    coefficient supplied in `fixed` is KEPT (used as its starting value); only the
-    remaining coefficients are randomized -- so a partial --coeffs seed pins the known
-    primes while the rest are explored randomly."""
+    coefficient list supplied in `fixed` is KEPT (used as its starting value), padded to
+    n_loc; only the remaining primes' coefficients are randomized -- so a partial --coeffs
+    seed pins the known primes while the rest are explored randomly."""
     fixed = fixed or {}
     out = {}
     for p in primes:
         if p in fixed:
-            out[p] = mpc(fixed[p])
+            vals = [mpc(x) for x in fixed[p]][:n_loc]
+            out[p] = vals + [_rand_c(scale) for _ in range(n_loc - len(vals))]
         else:
-            out[p] = mpc(2 * scale * (mpf(random.random()) - mpf("0.5")),
-                         2 * scale * (mpf(random.random()) - mpf("0.5")))
+            out[p] = [_rand_c(scale) for _ in range(n_loc)]
     return out
 
 
@@ -1037,7 +932,10 @@ def _coeff_distance(apA, apB):
     common = sorted(set(apA) & set(apB))
     if not common:
         return mpmath.inf
-    num = mpmath.fsum(abs(apA[p] - apB[p]) / p for p in common)
+    # per prime: sum |c_j(A) - c_j(B)| over the local-unknown components
+    def cdiff(p):
+        return mpmath.fsum(abs(a - b) for a, b in zip(apA[p], apB[p]))
+    num = mpmath.fsum(cdiff(p) / p for p in common)
     den = mpmath.fsum(mpf(1) / p for p in common)
     return num / den
 
@@ -1078,8 +976,9 @@ def explore_candidates(landscape, euler, point, boxsize, accuracy, working_preci
         primes = cand_primes[:k]
         # seeds: the given guess (known primes + zeros), then random restarts that KEEP
         # any given coefficients and randomize the rest, then a cold (all-zero) start
+        nloc = euler.complex_unknowns_per_prime
         seeds = ([guess] if guess is not None else []) + \
-                [_random_ap(primes, scale, fixed=guess) for _ in range(restarts)] + [None]
+                [_random_ap(primes, scale, nloc, fixed=guess) for _ in range(restarts)] + [None]
         for seed in seeds:
             if deadline is not None and time.time() > deadline:
                 break
@@ -1406,8 +1305,9 @@ def selftest(accuracy=8, working_precision=30, verbose=True):
         results.append(("a_p -> b(n) round-trip (n<=40)", rt_err, mpf(10) ** (-13)))
         if verbose:
             print(f"[M1] coefficient round-trip max error (n<=40) = {mpmath.nstr(rt_err,3)}")
-            print(f"     a_2 = {mpmath.nstr(ap[2],8)}   b(4) = a_2^2-conj(a_2) ?"
-                  f" {mpmath.nstr(b_recon[3],8)} vs {mpmath.nstr(ap[2]**2-mpmath.conj(ap[2]),8)}")
+            a2 = ap[2][0]
+            print(f"     a_2 = {mpmath.nstr(a2,8)}   b(4) = a_2^2-conj(a_2) ?"
+                  f" {mpmath.nstr(b_recon[3],8)} vs {mpmath.nstr(a2**2-mpmath.conj(a2),8)}")
 
         # --- M1: sizing -------------------------------------------------------
         weights = default_weight_set(14)
@@ -1516,10 +1416,10 @@ def selftest_m3(accuracy=8, working_precision=30, verbose=True):
         target = gl3_known_target()
         system = build_equation_system(target.landscape, target.euler, target.point,
                                        accuracy, working_precision)
-        gp = {p: target.ap[p] + mpc("1e-3", "1e-3") for p in system.primes}
+        gp = {p: [c + mpc("1e-3", "1e-3") for c in target.ap[p]] for p in system.primes}
 
         sol = solve_at_point(system, guess=gp)
-        a2_err = abs(sol["ap"][2] - target.ap[2]) if sol else mpf(1)
+        a2_err = abs(sol["ap"][2][0] - target.ap[2][0]) if sol else mpf(1)
         det_true = sol["det_res"] if sol else mpf(1)
         if verbose:
             print(f"[M3] true point, near guess: k={sol['k']}, det={mpmath.nstr(det_true,3)}, "
@@ -1675,7 +1575,10 @@ def _search_report(res, land, a, elapsed):
         if sol:
             out.append("sign epsilon = %s" % nstr(sol["epsilon"], coef_dig))
             for pp in sol["primes"]:
-                out.append("  a_%-3d = %s" % (pp, nstr(sol["ap"][pp], coef_dig)))
+                comps = sol["ap"][pp]
+                vals = ", ".join(nstr(c, coef_dig) for c in comps)
+                lbl = "a_%-3d =" % pp if len(comps) == 1 else "p=%-3d:" % pp
+                out.append("  %s %s" % (lbl, vals))
         # finer target: push 3 orders past a success, retry the original on a partial
         r_target = box * mpf("1e-3") if kind == "success" else target
         r_wp = res.get("wp", a.working_precision) + 10
@@ -1690,7 +1593,8 @@ def _search_report(res, land, a, elapsed):
         # include the recovered coefficients so this is a copy-paste resume; quoted
         # because the values contain '+'/spaces, and the leading '-' needs the = form
         if sol:
-            cs = ",".join(_fmt_complex(sol["ap"][p], coef_dig) for p in sol["primes"])
+            cs = ",".join(_fmt_complex(c, coef_dig)
+                          for p in sol["primes"] for c in sol["ap"][p])
             out.append('    --coeffs="%s"' % cs)
         else:
             out.append("    --coeffs=...")
@@ -1699,43 +1603,54 @@ def _search_report(res, land, a, elapsed):
     return "\n".join(out)
 
 
-def _parse_coeffs(text):
-    """Parse a starting-coefficient string into a {prime: a_p} dict.  Comma-separated:
-    bare values map positionally to the primes 2,3,5,7,11,...; 'p:val' tokens set a
-    specific prime.  Returns None for empty input."""
+def _parse_coeffs(text, n_loc=1):
+    """Parse a starting-coefficient string into a {prime: [c1, ..., c_{n_loc}]} dict.
+    Comma-separated; bare values are grouped n_loc at a time and assigned positionally
+    to the primes 2,3,5,7,...; a 'p:val' token sets prime p's first component.  For the
+    GL(3) family (n_loc=1) this is one value per prime.  Returns None for empty input."""
     if not text or not text.strip():
         return None
     primes = primes_up_to(10 ** 4)
-    out, pos = {}, 0
+    out, pos, buf = {}, 0, []
     for tok in text.split(","):
         tok = tok.strip()
         if not tok:
             continue
         if ":" in tok:
             p, v = tok.split(":")
-            out[int(p)] = mpc(complex(v.replace(" ", "")))
+            out.setdefault(int(p), [mpc(0)] * n_loc)
+            out[int(p)][0] = mpc(complex(v.replace(" ", "")))
         else:
-            out[primes[pos]] = mpc(complex(tok.replace(" ", "")))
-            pos += 1
+            buf.append(mpc(complex(tok.replace(" ", ""))))
+            if len(buf) == n_loc:
+                out[primes[pos]] = buf
+                buf, pos = [], pos + 1
+    if buf:                                   # trailing partial group -> pad with zeros
+        out[primes[pos]] = buf + [mpc(0)] * (n_loc - len(buf))
     return out
 
 
 def _search_cli(argv):
-    """Command-line search of the degree-3, tempered, conductor-N GL(3) Maass-form
-    landscape with Gamma factors
-        Gamma_R(s + i*l1) Gamma_R(s + i*l2) Gamma_R(s - i*(l1+l2)),
-    cold-started (Euler coefficients unknown) from a given spectral point, or
-    warm-started from supplied coefficients via --coeffs."""
+    """Command-line search of a landscape (loaded from the registry landscapes.txt by
+    name, or from an ad-hoc file), for an L-function near a starting spectral point.
+    Cold-started (Euler coefficients unknown) or warm-started from --coeffs."""
     import argparse
     import time
     p = argparse.ArgumentParser(
         prog="lsearch.py search",
-        description="Search the degree-3, tempered, conductor-N GL(3) landscape "
-                    "[Gamma_R(s+i*l1) Gamma_R(s+i*l2) Gamma_R(s-i*(l1+l2))] for an "
-                    "L-function near a starting spectral point (coefficients unknown).")
+        description="Search a tempered balanced analytic L-function landscape (named in "
+                    "the registry landscapes.txt, default R0R0R0N1) for an L-function "
+                    "near a starting spectral point.")
+    p.add_argument("--landscape", default="R0R0R0N1",
+                   help="registry name of the landscape (default R0R0R0N1)")
+    p.add_argument("--landscape-file", default=None, metavar="FILE",
+                   help="load the landscape from this file instead of the registry "
+                        "(same format as landscapes.txt; for development)")
     p.add_argument("--point", required=True,
-                   help="starting spectral point 'l1,l2', e.g. '14.14,2.4'")
-    p.add_argument("--conductor", type=int, default=1, help="conductor N")
+                   help="starting spectral point, e.g. '14.14,2.4' (one value per free "
+                        "spectral parameter / search dimension)")
+    p.add_argument("--conductor", type=int, default=None,
+                   help="override the landscape conductor N (default: as registered)")
     p.add_argument("--boxsize", default="1e-3", help="initial box half-width")
     p.add_argument("--accuracy", type=int, default=8, help="starting accuracy (digits)")
     p.add_argument("--working-precision", type=int, default=30,
@@ -1760,19 +1675,25 @@ def _search_cli(argv):
                    help="append the result report(s) to this file (e.g. to log a grid)")
     a = p.parse_args(argv)
 
-    l1, l2 = (mpf(t.strip()) for t in a.point.split(","))
+    import dataclasses
+    fam = get_family(a.landscape, a.landscape_file)
+    land, euler = fam.landscape, fam.euler
+    if a.conductor is not None and a.conductor != land.conductor:
+        land = dataclasses.replace(land, conductor=a.conductor)
+    point = tuple(mpf(t.strip()) for t in a.point.split(","))
+    if len(point) != land.dim:
+        p.error("landscape %s has %d free spectral parameter(s); --point gave %d"
+                % (a.landscape, land.dim, len(point)))
+    if land.dim != 2:
+        p.error("the box-search geometry currently supports 2 spectral parameters only "
+                "(landscape %s has %d)" % (a.landscape, land.dim))
     mp.dps = a.working_precision
-    land = Landscape(
-        name="GL(3) degree 3, conductor %d" % a.conductor,
-        degree=3, conductor=a.conductor, dim=2,
-        mu_from_point=lambda pt: [1j * mpf(pt[0]), 1j * mpf(pt[1]),
-                                  -1j * (mpf(pt[0]) + mpf(pt[1]))],
-        nu_from_point=lambda pt: [])
     eg = mpc(complex(a.epsilon.replace(" ", "")))
-    guess = _parse_coeffs(a.coeffs)     # given coefficients are KEPT; the rest randomized
+    # given coefficients are KEPT; the rest randomized (n_loc components per prime)
+    guess = _parse_coeffs(a.coeffs, euler.complex_unknowns_per_prime)
     t0 = time.time()
     results = search_landscape(
-        land, GL3_EULER, (l1, l2), mpf(a.boxsize), a.accuracy, a.working_precision,
+        land, euler, point, mpf(a.boxsize), a.accuracy, a.working_precision,
         mpf(a.target), restarts=a.restarts, guess=guess, eps_guess=eg,
         max_iter=a.max_iter, wander_dist=mpf(a.wander_dist), timeout=a.timeout,
         verbose=True)
