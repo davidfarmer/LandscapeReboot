@@ -943,7 +943,7 @@ def _coeff_distance(apA, apB):
 def explore_candidates(landscape, euler, point, boxsize, accuracy, working_precision,
                        restarts=20, guess=None, eps_guess=None, k_min=3, k_max=None,
                        coeff_tol=mpf("0.05"), max_candidates=5, scale=mpf(2),
-                       deadline=None, verbose=True):
+                       deadline=None, verbose=True, trace=False):
     """Find DISTINCT candidate solutions of the system near `point`.
 
     Varies the number of coefficients k (from k_min up to the available significant
@@ -957,6 +957,10 @@ def explore_candidates(landscape, euler, point, boxsize, accuracy, working_preci
     h = mpf(boxsize)
     corners = triangle_corners(point, h)
     mp.dps = working_precision
+    if trace:
+        print(f"  building equation system at ({mpmath.nstr(point[0],10)}, "
+              f"{mpmath.nstr(point[1],10)})  (accuracy {accuracy}, working precision "
+              f"{working_precision}) ...")
     sys0 = build_equation_system(landscape, euler, corners[0], accuracy, working_precision)
     weights = WeightSet(weights=sys0.weights)
     systems = [sys0] + [build_equation_system(landscape, euler, c, accuracy,
@@ -970,6 +974,11 @@ def explore_candidates(landscape, euler, point, boxsize, accuracy, working_preci
     k_min = max(1, min(k_min, k_max))
     eps_guess = eps_guess or mpc(1)
 
+    if trace:
+        print(f"  exploring near ({mpmath.nstr(point[0],10)}, {mpmath.nstr(point[1],10)}): "
+              f"k={k_min}..{k_max}, {restarts} random restart(s) per k"
+              + (" (+ given coeffs)" if guess is not None else ""))
+
     # (1) corner-0 solutions over k and random restarts (re-solves on the one build)
     sols0 = []
     for k in range(k_min, k_max + 1):
@@ -979,6 +988,7 @@ def explore_candidates(landscape, euler, point, boxsize, accuracy, working_preci
         nloc = euler.complex_unknowns_per_prime
         seeds = ([guess] if guess is not None else []) + \
                 [_random_ap(primes, scale, nloc, fixed=guess) for _ in range(restarts)] + [None]
+        n_before = len(sols0)
         for seed in seeds:
             if deadline is not None and time.time() > deadline:
                 break
@@ -986,6 +996,14 @@ def explore_candidates(landscape, euler, point, boxsize, accuracy, working_preci
                                k_init=k, k_max=k, deadline=deadline)
             if s is not None:
                 sols0.append(s)
+        if trace:                          # per-k progress so the wait is not silent
+            found = sols0[n_before:]
+            best = min((s["det_res"] for s in found), default=None)
+            print(f"    k={k}: {len(found)} solution(s)"
+                  + (f", best detector residual {mpmath.nstr(best,2)}" if best is not None
+                     else "")
+                  + (" [time limit reached]"
+                     if deadline is not None and time.time() > deadline else ""))
         if deadline is not None and time.time() > deadline:
             break
 
@@ -1027,13 +1045,20 @@ def explore_candidates(landscape, euler, point, boxsize, accuracy, working_preci
             print(f"    candidate {n}: center=({mpmath.nstr(c['center'][0],10)}, "
                   f"{mpmath.nstr(c['center'][1],10)})  k={c['k']}  "
                   f"det={mpmath.nstr(c['det'],2)}")
+            # show the candidate's Euler coefficients, not just its spectral point
+            for p in sorted(c["ap"]):
+                comps = c["ap"][p]
+                vals = ", ".join(mpmath.nstr(x, 8) for x in comps)
+                lbl = f"a_{p}" if len(comps) == 1 else f"p={p}"
+                print(f"        {lbl} = {vals}")
     return out
 
 
 def search_landscape(landscape, euler, point, boxsize, accuracy, working_precision,
                      target_box, restarts=20, guess=None, eps_guess=None, max_iter=40,
                      wander_dist=mpf("0.25"), timeout=600, refine_coeffs=True,
-                     coeff_tol=mpf("0.05"), max_candidates=5, verbose=True):
+                     coeff_tol=mpf("0.05"), max_candidates=5, verbose=False,
+                     on_result=None):
     """Explore near `point` for distinct candidate solutions (varying k and random
     Broyden restarts), then refine EACH distinct candidate into an L-point.  The time
     limit guards only the exploration; refinement of a real candidate runs to completion.
@@ -1042,7 +1067,12 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
     significant primes (a full RESUME), the random exploration is skipped entirely and the
     point is refined directly -- exploration there is pointless and its time limit would
     otherwise expire during the (slow, high-accuracy) builds before any solve.  Returns a
-    list of result dicts (one per candidate refined), each with 'secs'."""
+    list of result dicts (one per candidate refined), each with 'secs'.
+
+    The distinct candidates (spectral point AND coefficients) are always listed.
+    `verbose` additionally prints the per-iteration detail of each refinement.  If an
+    `on_result(n, res)` callback is given it is invoked as soon as each candidate finishes
+    refining, so the caller can report results incrementally rather than only at the end."""
     explore_acc = int(round(mpf(accuracy)))
     explore_wp = max(int(working_precision), 2 * explore_acc + 20)
     deadline = (time.time() + timeout) if timeout else None
@@ -1055,9 +1085,8 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
         sys0 = build_equation_system(landscape, euler, point, explore_acc, explore_wp)
         # full resume if the guess covers (all but at most one of) the significant primes
         if sys0.primes and len(set(sys0.primes) - set(guess)) <= 1:
-            if verbose:
-                print("  resume: all significant primes supplied -> refining directly "
-                      "(no random exploration, no time limit)")
+            print("  resume: all significant primes supplied -> refining directly "
+                  "(no random exploration, no time limit)")
             t0 = time.time()
             # no time limit on a resume: the point is a known L-function, so the limit
             # (which exists to abandon hopeless far points) does not apply; max_iter bounds
@@ -1068,6 +1097,8 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                          refine_coeffs=refine_coeffs, verbose=verbose)
             res["secs"] = time.time() - t0
             res["candidate"] = 0
+            if on_result is not None:
+                on_result(0, res)
             return [res]
 
     # When some coefficients are supplied (a partial resume / known-point context), lift
@@ -1077,15 +1108,15 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
     explore_deadline = None if guess is not None else deadline
     refine_timeout = None if guess is not None else timeout
 
+    # the candidate list (spectral points AND coefficients) is always shown
     cands = explore_candidates(landscape, euler, point, boxsize, explore_acc, explore_wp,
                                restarts=restarts, guess=guess, eps_guess=eps_guess,
                                coeff_tol=coeff_tol, max_candidates=max_candidates,
-                               deadline=explore_deadline, verbose=verbose)
+                               deadline=explore_deadline, verbose=True, trace=verbose)
     results = []
     for n, cand in enumerate(cands):
-        if verbose:
-            print(f"  === refining candidate {n} at ({mpmath.nstr(cand['center'][0],10)}, "
-                  f"{mpmath.nstr(cand['center'][1],10)}) ===")
+        print(f"  === refining candidate {n} at ({mpmath.nstr(cand['center'][0],10)}, "
+              f"{mpmath.nstr(cand['center'][1],10)}) ===")
         t0 = time.time()
         res = search(landscape, euler, cand["center"], boxsize, accuracy,
                      working_precision, target_box, guess=cand["ap"],
@@ -1095,6 +1126,8 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
         res["secs"] = time.time() - t0
         res["candidate"] = n
         results.append(res)
+        if on_result is not None:        # report each candidate as soon as it finishes
+            on_result(n, res)
     return results
 
 
@@ -1666,6 +1699,9 @@ def _search_cli(argv):
                    help="wall-clock seconds for the exploration phase only (default 600)")
     p.add_argument("--restarts", type=int, default=20,
                    help="random Broyden restarts per coefficient count in exploration")
+    p.add_argument("--max-candidates", type=int, default=5,
+                   help="maximum number of distinct candidate solutions to keep from "
+                        "exploration and refine (default 5)")
     p.add_argument("--coeffs", default=None,
                    help="starting Euler coefficients to warm-start from, as a comma list "
                         "a_2,a_3,a_5,a_7,... (positional by prime) and/or 'p:val' tokens, "
@@ -1673,6 +1709,11 @@ def _search_cli(argv):
                         "search warm-starts from them instead of cold random exploration.")
     p.add_argument("--append", default=None, metavar="FILE",
                    help="append the result report(s) to this file (e.g. to log a grid)")
+    p.add_argument("--verbose", action="store_true",
+                   help="print the per-iteration detail of each refinement (spectral "
+                        "parameters, box size, coefficients, sign, accuracy, ...).  "
+                        "Without it, only the candidate list and per-candidate results "
+                        "are shown.")
     a = p.parse_args(argv)
 
     import dataclasses
@@ -1692,31 +1733,38 @@ def _search_cli(argv):
     # given coefficients are KEPT; the rest randomized (n_loc components per prime)
     guess = _parse_coeffs(a.coeffs, euler.complex_unknowns_per_prime)
     t0 = time.time()
+
+    # report each candidate's result block as soon as it finishes refining, and keep the
+    # blocks for the optional --append log
+    blocks = []
+
+    def on_result(n, res):
+        block = ("CANDIDATE %s:\n%s"
+                 % (res.get("candidate", n),
+                    _search_report(res, land, a, res.get("secs", time.time() - t0))))
+        print()
+        print(block)
+        blocks.append(block)
+
     results = search_landscape(
         land, euler, point, mpf(a.boxsize), a.accuracy, a.working_precision,
         mpf(a.target), restarts=a.restarts, guess=guess, eps_guess=eg,
         max_iter=a.max_iter, wander_dist=mpf(a.wander_dist), timeout=a.timeout,
-        verbose=True)
+        max_candidates=a.max_candidates, verbose=a.verbose, on_result=on_result)
     elapsed = time.time() - t0
 
-    blocks = []
     if not results:
-        blocks.append("=" * 68 + "\nNo candidate solutions found near %s within %s s.\n"
-                      % (a.point, mpmath.nstr(mpf(a.timeout), 3)) + "=" * 68)
+        summary = ("=" * 68 + "\nNo candidate solutions found near %s within %s s.\n"
+                   % (a.point, mpmath.nstr(mpf(a.timeout), 3)) + "=" * 68)
     else:
         succ = sum(1 for r in results if r.get("status") in ("success", "converged"))
-        blocks.append("FOUND %d candidate(s); %d refined to an L-point. "
-                      "total time %.1f s." % (len(results), succ, elapsed))
-        for r in results:
-            blocks.append("CANDIDATE %s:\n%s"
-                          % (r.get("candidate", "?"),
-                             _search_report(r, land, a, r.get("secs", elapsed))))
-    out = "\n\n".join(blocks)
+        summary = ("FOUND %d candidate(s); %d refined to an L-point. total time %.1f s."
+                   % (len(results), succ, elapsed))
     print()
-    print(out)
+    print(summary)
     if a.append:
         with open(a.append, "a") as fh:
-            fh.write(out + "\n\n")
+            fh.write("\n\n".join([summary] + blocks) + "\n\n")
         print("(appended to %s)" % a.append)
 
 
