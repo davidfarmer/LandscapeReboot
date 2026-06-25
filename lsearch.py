@@ -55,6 +55,7 @@ import mpmath
 from mpmath import mp, mpf, mpc
 
 from afe import (coefficient_relation, coefficient_relation_grid,
+                 lmfdb_to_rubinstein, _min_contour,
                  GL3_MAASS, gl3_maass_bcoeffs)
 from families import (Landscape, EulerProduct, KnownTarget, Family,
                       primes_up_to, prime_pi, _smallest_prime_factor_table,
@@ -62,6 +63,15 @@ from families import (Landscape, EulerProduct, KnownTarget, Family,
 
 # The fixed evaluation point for every coefficient_relation call (symmetry point).
 FIXED_S = mpf(1) / 2
+
+# Integration contour distance beyond the rightmost singularity, nu0 = bound + margin.
+# The aliasing error is e^{-2 pi d / h} = 10^{-accuracy} for any d (h = 2 pi d / L is
+# chosen to make it so), so moving the contour OUT only shrinks the grid (fewer points,
+# faster builds) at no accuracy cost -- until d is so large the Gamma factors' dynamic
+# range costs precision.  Empirically margin 2 is ~4x faster than the old 0.5 with
+# bit-identical solve quality at wp~30 (see exp_contour / exp_solve_contour); margin 4
+# is ~6x but starts to lose a digit.  2 is the safe default.
+CONTOUR_MARGIN = mpf(2)
 
 
 # (Prime helpers, the Landscape/EulerProduct/KnownTarget data model, and the
@@ -220,20 +230,29 @@ def unpack_unknowns(u, primes, n_loc=1):
 
 def build_equation_system(landscape, euler, point, accuracy, working_precision=None,
                           poles=(), sign=None, n_detectors=8, lead_terms=5,
-                          weight_set=None):
+                          weight_set=None, contour_nu=None):
     """Precompute the residual system at `point` (the expensive Gamma/g work).
 
     If `weight_set` is given it is used as-is; otherwise a default set sized to the
-    number of unknowns is generated."""
+    number of unknowns is generated.  `contour_nu` overrides the integration contour
+    Re(z)=nu0 (default bound+1/2); moving it out shrinks the contour grid (faster
+    builds) with the aliasing error staying at target -- see exp_contour."""
     mu = landscape.mu_from_point(point)
     nu = landscape.nu_from_point(point)
     bmax = admissibility_bound(landscape) - mpf("1.0")   # keep beta well clear of the bound
     #   (right at bound-0.8 the integrand converges very slowly: M jumps from ~27 to ~160)
 
+    # default integration contour: out at bound + CONTOUR_MARGIN (faster grid, same
+    # accuracy -- see CONTOUR_MARGIN).  At s=1/2 the f1/f2 bounds coincide.
+    if contour_nu is None:
+        gd0 = lmfdb_to_rubinstein(mu, nu, landscape.conductor, 1)
+        contour_nu = _min_contour(FIXED_S, gd0.kappa, gd0.lam) + CONTOUR_MARGIN
+
     # one auto-truncating call (most demanding weight) fixes the Dirichlet length M
     Msz = coefficient_relation(FIXED_S, mu=mu, nu=nu, N=landscape.conductor, epsilon=1,
                                poles=list(poles), g_m=0, g_alpha=0, g_beta=bmax,
-                               accuracy=accuracy, working_precision=working_precision)
+                               accuracy=accuracy, working_precision=working_precision,
+                               contour_nu=contour_nu)
     M = Msz.num_terms
 
     if weight_set is not None:
@@ -248,7 +267,8 @@ def build_equation_system(landscape, euler, point, accuracy, working_precision=N
 
     # ONE shared Gamma grid for all weights (the big speed-up)
     rows = coefficient_relation_grid(FIXED_S, mu, nu, landscape.conductor, 1,
-                                     list(poles), wlist, M, working_precision)
+                                     list(poles), wlist, M, working_precision,
+                                     contour_nu=contour_nu)
 
     A, B, pole, scales = [], [], [], []
     for (Ar, Br, pr) in rows:
