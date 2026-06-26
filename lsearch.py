@@ -876,8 +876,13 @@ def _average_solution(sols):
 ACC_OVER = mpf(8)
 ACC_MARGIN = 2                  # accuracy headroom beyond what the target box needs
 GUARD_DIGITS = 12               # wp must beat accuracy+log10(cond) by this many digits
-BOX_GROW = mpf(4)               # factor to grow the box per iteration when the L-point
-#                                 is not yet bracketed (determination coarser than box)
+BOX_GROW = mpf(4)               # max factor to grow the box per iteration
+BOX_SHRINK = mpf(5)             # max factor to shrink the box per iteration
+BOX_MARGIN = mpf("1.5")         # target box = BOX_MARGIN * determination (bracket w/ margin)
+BOX_DEADBAND = mpf("1.3")       # hold the box if the target is within this factor of it
+#   (dead-band + rate limits make the box TRACK the determination smoothly instead of
+#    flip-flopping between grow and zoom when the determination hovers near the box size)
+RECENTER_CAP = mpf(2)           # step toward the cloud at most this many box sizes / iter
 
 
 def _acc_max_for_target(target_box, ln10):
@@ -1342,91 +1347,83 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
         else:    # always report the point + first couple of coefficients each iteration
             _report_iteration_brief(it, center, spread, boxsize, det_res, sol)
 
-        # Is the L-point pinned WITHIN the current box?  The detector cloud is an affine
-        # model valid only across the box, so if the determination (spread) is coarser
-        # than the box the cloud centre is an unreliable extrapolation.
-        determined = spread < boxsize
+        # --- smooth box controller -------------------------------------------------
+        # The detector cloud is an affine model valid across the box, so we want the box to
+        # bracket the determination (cloud spread) with some margin.  Track the target box
+        # (BOX_MARGIN * spread) with a per-iteration RATE LIMIT (<= BOX_GROW grow,
+        # <= BOX_SHRINK shrink) and a DEAD-BAND: if the target is within BOX_DEADBAND of the
+        # current box, hold the box and raise accuracy instead (which tightens the
+        # determination, letting the box shrink next iteration).  This makes the box track
+        # the determination SMOOTHLY rather than flip-flopping between grow and zoom when
+        # the determination hovers near the box size (the oscillation that wandered off and
+        # failed on a cold start).
+        desired = spread * BOX_MARGIN
+        if desired > boxsize * BOX_DEADBAND:           # under-determined -> grow
+            new_box = min(desired, boxsize * BOX_GROW, wander_dist)
+        elif desired < boxsize / BOX_DEADBAND:         # over-determined -> shrink (zoom)
+            new_box = max(desired, boxsize / BOX_SHRINK)
+        else:
+            new_box = boxsize                          # dead-band: hold
 
-        if not determined:
-            # The L-point is not bracketed by the box -> GROW the box (BOX_GROW per
-            # iteration, capped at wander_dist) until it brackets the point, then the
-            # determined branch below zooms in.  This is what lets a search started on a box
-            # far smaller than the distance to the nearest L-function still converge (e.g. a
-            # coarse grid).  While under-determined the cloud centre is a long, noisy
-            # extrapolation, so DAMP the recenter: step toward it but cap the move at the
-            # new box size.  Early on (tiny box, far/noisy centre) the point barely moves
-            # (~keep it); as the box grows and the centre becomes a trustworthy ~1x
-            # extrapolation the cap lets the point move (almost) all the way onto it.  The
-            # wander check is left to the determined branch (the centre is too noisy here).
-            g, eg = sol["ap"], sol["epsilon"]
-            prev_det = spread
-            new_box = min(boxsize * BOX_GROW, wander_dist)
-            move_cap = 2 * new_box                          # damp: move at most 2 box sizes
-            step = [center[0] - point[0], center[1] - point[1]]
-            mag = max(abs(step[0]), abs(step[1]))
-            if mag > move_cap and mag > 0:
-                sc = move_cap / mag
-                new_point = (point[0] + step[0] * sc, point[1] + step[1] * sc)
-            else:
-                new_point = center
-            last = {"point": new_point, "box": new_box, "iter": it,
-                    "accuracy": int(round(accuracy)), "wp": wp,
-                    "cloud_prec": cloud_prec, "det_res": det_res, "sol": sol}
-            if boxsize >= wander_dist:
-                # grown all the way to the wander limit without bracketing any L-function
-                return {"status": "fail", "reason": "no point within range", "iter": it,
-                        **last}
-            if verbose:
-                print(f"   determination +-{mpmath.nstr(spread, 2)} coarser than box "
-                      f"{mpmath.nstr(boxsize, 2)}; growing box -> {mpmath.nstr(new_box, 2)} "
-                      f"and stepping {mpmath.nstr(min(mag, move_cap), 2)} toward the cloud")
-            point, boxsize = new_point, new_box
-            continue
+        bracketed = spread < boxsize                   # cloud centre a valid interpolation?
 
-        # Determined: the box brackets the point -> recenter to the cloud centre and zoom.
-        # Cap the shrink at 5x per iteration: a determination that is a lucky underestimate
-        # at a large box would otherwise collapse the box too far, leaving the next
-        # iteration under-determined and forcing a re-grow (oscillation).
-        new_box = max(min(spread * mpf("1.2"), boxsize), boxsize / 5)
+        # Recenter toward the cloud centre, damped: cap the move at RECENTER_CAP box sizes.
+        # While under-determined the centre is a long, noisy extrapolation and the cap (a
+        # small multiple of the small box) barely moves the point; once bracketed the cap
+        # is comparable to the offset so the point moves (almost) onto the cloud centre.
+        move_cap = RECENTER_CAP * new_box
+        step = [center[0] - point[0], center[1] - point[1]]
+        mag = max(abs(step[0]), abs(step[1]))
+        if mag > move_cap and mag > 0:
+            new_point = (point[0] + step[0] * move_cap / mag,
+                         point[1] + step[1] * move_cap / mag)
+        else:
+            new_point = center
 
-        # Wander check: give up if the cloud centre has drifted more than an ABSOLUTE
-        # distance wander_dist from the grid point we started at.
-        if max(abs(center[0] - start[0]), abs(center[1] - start[1])) > wander_dist:
-            return {"status": "fail", "reason": "wandered", "iter": it, "point": center,
-                    "box": new_box}
+        # Wander check only once bracketed (while under-determined the centre is too noisy).
+        if bracketed and max(abs(new_point[0] - start[0]),
+                             abs(new_point[1] - start[1])) > wander_dist:
+            return {"status": "fail", "reason": "wandered", "iter": it,
+                    "point": new_point, "box": new_box}
 
-        last = {"point": center, "box": new_box, "iter": it,
+        last = {"point": new_point, "box": new_box, "iter": it,
                 "accuracy": int(round(accuracy)), "wp": wp,
                 "cloud_prec": cloud_prec, "det_res": det_res, "sol": sol}
 
-        if new_box <= target:
+        # once the box brackets the point, refine in earnest (lift the exploration limit)
+        if bracketed and not refining:
+            refining = True
+            if verbose:
+                print("   (bracketed the L-point -> refining)")
+
+        if new_box <= target and bracketed:
             return _finalize_coeffs({"status": "success", **last},
                                     landscape, euler, refine_coeffs, verbose)
 
-        # Progress logic (recenter every iteration -- handled at the bottom):
+        if not bracketed and boxsize >= wander_dist:
+            # grown to the wander limit without bracketing any L-function
+            return {"status": "fail", "reason": "no point within range", "iter": it, **last}
+
+        # progress / stall: box shrinking -> progress; box held (dead-band) and the
+        # determination no longer improving with accuracy -> the detector floor
         if new_box < boxsize * stall_factor:
-            # box shrank -> a real candidate is homing in; refine in earnest
             stalls = 0
-            if not refining:
-                refining = True
-                if verbose:
-                    print("   (box shrank -> switching from exploration to refinement)")
             if verbose:
-                print(f"   box size decreased: {mpmath.nstr(boxsize, 2)} -> "
-                      f"{mpmath.nstr(new_box, 2)}")
+                print(f"   box shrank: {mpmath.nstr(boxsize, 2)} -> {mpmath.nstr(new_box, 2)}"
+                      f"  (determination +-{mpmath.nstr(spread, 2)})")
+        elif new_box > boxsize:
+            stalls = 0
+            if verbose:
+                print(f"   box grew: {mpmath.nstr(boxsize, 2)} -> {mpmath.nstr(new_box, 2)}"
+                      f"  (determination +-{mpmath.nstr(spread, 2)})")
         elif (prev_det is None or spread < prev_det * stall_factor) and \
                 int(round(accuracy)) < acc_max:
-            # box did not shrink, but the determination is still improving and there is
-            # room to raise accuracy -> couple accuracy to the determination (carried to
-            # the next iteration), recenter and try again instead of giving up
             accuracy = min(mpf(acc_max), accuracy + 2)
             stalls = 0
             if verbose:
-                print(f"   determination +-{mpmath.nstr(spread, 2)} not yet inside box "
-                      f"{mpmath.nstr(boxsize, 2)}; raising accuracy to "
-                      f"{int(round(accuracy))}")
+                print(f"   determination +-{mpmath.nstr(spread, 2)} ~ box "
+                      f"{mpmath.nstr(boxsize, 2)}; raising accuracy to {int(round(accuracy))}")
         else:
-            # not shrinking and not improving (or accuracy maxed) -> detector floor
             stalls += 1
             if stalls >= stall_patience:
                 return _finalize_coeffs(
@@ -1435,7 +1432,7 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
 
         prev_det = spread
         g, eg = sol["ap"], sol["epsilon"]
-        point, boxsize = center, new_box        # recenter every iteration
+        point, boxsize = new_point, new_box
     return {"status": "fail", "reason": "max_iter",
             **(last or {"point": point}), "iter": it}
 
