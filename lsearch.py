@@ -876,6 +876,8 @@ def _average_solution(sols):
 ACC_OVER = mpf(8)
 ACC_MARGIN = 2                  # accuracy headroom beyond what the target box needs
 GUARD_DIGITS = 12               # wp must beat accuracy+log10(cond) by this many digits
+BOX_GROW = mpf(4)               # factor to grow the box per iteration when the L-point
+#                                 is not yet bracketed (determination coarser than box)
 
 
 def _acc_max_for_target(target_box, ln10):
@@ -919,6 +921,20 @@ def _report_iteration(it, center, spread, cloud_prec, accuracy, wp, boxsize,
         vals = ", ".join(mpmath.nstr(c, cdig) for c in comps)
         label = f"a_{p:<3d}=" if len(comps) == 1 else f"p={p:<3d}:"
         print(f"      {label} {vals}")
+
+
+def _report_iteration_brief(it, center, spread, boxsize, det_res, sol):
+    """One-line per-iteration summary (printed when not in --verbose mode): the L-point,
+    box size, determination, detector residual, and the first couple of Euler
+    coefficients -- enough to follow the trajectory at a glance."""
+    ln10 = mpmath.log(10)
+    show = int(max(0, -mpmath.log(spread) / ln10)) + 3 if spread else 12
+    cdig = min(6, int(max(0, -mpmath.log(det_res) / ln10)) + 3) if det_res and det_res > 0 else 6
+    coeffs = "".join(f"  a_{p}={mpmath.nstr(sol['ap'][p][0], cdig)}"
+                     for p in sol["primes"][:2])
+    print(f"  iter {it}: L-point=({mpmath.nstr(center[0], show)}, "
+          f"{mpmath.nstr(center[1], show)})  box={mpmath.nstr(boxsize, 2)}  "
+          f"det={mpmath.nstr(det_res, 2)}{coeffs}")
 
 
 def _rand_c(scale):
@@ -1178,13 +1194,21 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
            guess=None, eps_guess=None, max_iter=40, wander_dist=mpf("0.25"),
            stall_factor=mpf("0.9"), stall_patience=2, solver="square",
            refine_coeffs=True, timeout=600, verbose=True):
-    """Iterative search (Steps 1-8): shrink a triangular box toward an L-function,
-    raising the accuracy (to tighten the spectral-parameter cloud) and the working
-    precision (to keep the cloud points trustworthy) as the box shrinks.
+    """Iterative search (Steps 1-8): move a triangular box toward an L-function, raising
+    the accuracy (to tighten the spectral-parameter cloud) and the working precision (to
+    keep the cloud points trustworthy) as the box shrinks.
 
-    Stops with 'success' if the box reaches target_box, or 'converged' if the box stops
-    shrinking -- the detector floor (prime truncation) has been hit and no more digits
-    are available at this accuracy.  Returns a status dict.
+    The box is ADAPTIVE.  The detector cloud is an affine model valid only across the box,
+    so if the determination (cloud spread) is coarser than the box the L-point is not yet
+    bracketed and the box is GROWN (by BOX_GROW per iteration, centre held, up to
+    wander_dist) until it brackets a point; once bracketed the box recenters on the cloud
+    and SHRINKS to zoom in.  This lets a search started on a box far smaller than the
+    distance to the nearest L-function (e.g. a coarse grid point) still converge, instead
+    of failing because a tiny box can never reach the right scale.
+
+    Stops with 'success' if the box reaches target_box, 'converged' if the box stops
+    shrinking (detector floor hit), or 'no point within range' if the box grows to
+    wander_dist without bracketing any L-function.  Returns a status dict.
 
     Example -- refine a point near the first SL(3,Z) Maass form in this landscape::
 
@@ -1244,7 +1268,15 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
         # one box step per iteration (the centre RECENTERS each iteration, so it can walk
         # toward a form), with the precision guard redoing it until
         # wp >= accuracy + log10(cond) + GUARD_DIGITS
-        for attempt in range(6):
+        # one box step per iteration, wrapped in a retry loop with two guards:
+        #  * precision: redo at higher wp until wp >= accuracy + log10(cond) + GUARD, and
+        #    ALSO if the step fails outright -- a too-low wp makes the corner solve fail
+        #    (no cloud), and the reactive guard alone never recovers from that;
+        #  * box too big: if even at ample wp there is still no cloud, the corners are too
+        #    far apart to solve -> shrink the box and retry.
+        bs = cond = center = spread = None
+        good = None      # last SUCCESSFUL (bs, center, spread, cond, wp) this iteration
+        for attempt in range(12):
             if _timed_out():
                 return {"status": "timeout", "reason": "time limit", "iter": it,
                         **(last or {"point": point})}
@@ -1255,27 +1287,107 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
             if _timed_out():
                 return {"status": "timeout", "reason": "time limit", "iter": it,
                         **(last or {"point": point})}
-            if bs is None or not bs["cloud"]:
-                return {"status": "fail", "reason": "no solution", "iter": it}
-            cond = bs["cond_solve"]
-            center, spread = cloud_center_spread(bs["cloud"])
-            new_box = min(spread * mpf("1.2"), boxsize)
-            need = int(mpmath.ceil(accuracy + mpmath.log(cond) / ln10 + GUARD_DIGITS))
-            if wp >= need:
+            if bs is not None and bs["cloud"]:
+                cond = bs["cond_solve"]
+                center, spread = cloud_center_spread(bs["cloud"])
+                good = (bs, center, spread, cond, wp)      # remember this success
+                need = int(mpmath.ceil(accuracy + mpmath.log(cond) / ln10 + GUARD_DIGITS))
+                if wp >= need:
+                    break                              # good step at adequate precision
+                new_wp = need + 3   # 3 digits of headroom so we don't redo again at once
+                if verbose:         # show the provisional guess so a redo isn't a silent wait
+                    print(f"   provisional guess: L-point=({mpmath.nstr(center[0], 12)}, "
+                          f"{mpmath.nstr(center[1], 12)})  box size={mpmath.nstr(boxsize, 2)}")
+                    print(f"   (redo: wp {wp} < accuracy+log10(cond)+{GUARD_DIGITS} = "
+                          f"{need} -> raising wp to {new_wp})")
+                wp = new_wp
+                continue
+            # no cloud at this wp.  If a LOWER-wp step already succeeded this iteration, a
+            # precision redo has just failed (box_step is not monotone in wp -- a corner
+            # solve can diverge at a higher wp); fall back to that good step rather than
+            # discarding it.
+            if good is not None:
+                bs, center, spread, cond, wp = good
+                if verbose:
+                    print(f"   (higher-precision redo failed; keeping the wp {wp} step)")
                 break
-            new_wp = need + 3       # 3 digits of headroom so we don't redo again at once
-            if verbose:    # show the provisional guess so a redo isn't a silent wait
-                print(f"   provisional guess: L-point=({mpmath.nstr(center[0], 12)}, "
-                      f"{mpmath.nstr(center[1], 12)})  box size={mpmath.nstr(boxsize, 2)}")
-                print(f"   (redo: wp {wp} < accuracy+log10(cond)+{GUARD_DIGITS} = "
-                      f"{need} -> raising wp to {new_wp})")
-            wp = new_wp
+            # never got a cloud: first suspect a too-low wp (the corner solve failed) and
+            # raise wp, up to a generous ceiling.
+            if wp < int(mpmath.ceil(accuracy)) + GUARD_DIGITS + 24:
+                new_wp = wp + max(10, GUARD_DIGITS)
+                if verbose:
+                    print(f"   (box step failed at wp {wp}; raising wp to {new_wp} "
+                          f"and retrying)")
+                wp = new_wp
+                continue
+            # wp is already generous -> the box is too big (corners diverge); shrink it.
+            if boxsize > target * 4:
+                boxsize = boxsize / 2
+                if verbose:
+                    print(f"   (box step failed; box too large -> shrinking to "
+                          f"{mpmath.nstr(boxsize, 2)} and retrying)")
+                continue
+            return {"status": "fail", "reason": "no solution", "iter": it,
+                    **(last or {"point": point})}
+        else:
+            return {"status": "fail", "reason": "no solution", "iter": it,
+                    **(last or {"point": point})}
+
         cloud_prec = estimate_cloud_precision(bs)
         det_res = max((s["det_res"] for s in bs["sols"] if s), default=mpf(0))
         sol = _average_solution(bs["sols"])
         if verbose:
             _report_iteration(it, center, spread, cloud_prec, accuracy, wp,
                               boxsize, cond, sol, det_res)
+        else:    # always report the point + first couple of coefficients each iteration
+            _report_iteration_brief(it, center, spread, boxsize, det_res, sol)
+
+        # Is the L-point pinned WITHIN the current box?  The detector cloud is an affine
+        # model valid only across the box, so if the determination (spread) is coarser
+        # than the box the cloud centre is an unreliable extrapolation.
+        determined = spread < boxsize
+
+        if not determined:
+            # The L-point is not bracketed by the box -> GROW the box (BOX_GROW per
+            # iteration, capped at wander_dist) until it brackets the point, then the
+            # determined branch below zooms in.  This is what lets a search started on a box
+            # far smaller than the distance to the nearest L-function still converge (e.g. a
+            # coarse grid).  While under-determined the cloud centre is a long, noisy
+            # extrapolation, so DAMP the recenter: step toward it but cap the move at the
+            # new box size.  Early on (tiny box, far/noisy centre) the point barely moves
+            # (~keep it); as the box grows and the centre becomes a trustworthy ~1x
+            # extrapolation the cap lets the point move (almost) all the way onto it.  The
+            # wander check is left to the determined branch (the centre is too noisy here).
+            g, eg = sol["ap"], sol["epsilon"]
+            prev_det = spread
+            new_box = min(boxsize * BOX_GROW, wander_dist)
+            move_cap = 2 * new_box                          # damp: move at most 2 box sizes
+            step = [center[0] - point[0], center[1] - point[1]]
+            mag = max(abs(step[0]), abs(step[1]))
+            if mag > move_cap and mag > 0:
+                sc = move_cap / mag
+                new_point = (point[0] + step[0] * sc, point[1] + step[1] * sc)
+            else:
+                new_point = center
+            last = {"point": new_point, "box": new_box, "iter": it,
+                    "accuracy": int(round(accuracy)), "wp": wp,
+                    "cloud_prec": cloud_prec, "det_res": det_res, "sol": sol}
+            if boxsize >= wander_dist:
+                # grown all the way to the wander limit without bracketing any L-function
+                return {"status": "fail", "reason": "no point within range", "iter": it,
+                        **last}
+            if verbose:
+                print(f"   determination +-{mpmath.nstr(spread, 2)} coarser than box "
+                      f"{mpmath.nstr(boxsize, 2)}; growing box -> {mpmath.nstr(new_box, 2)} "
+                      f"and stepping {mpmath.nstr(min(mag, move_cap), 2)} toward the cloud")
+            point, boxsize = new_point, new_box
+            continue
+
+        # Determined: the box brackets the point -> recenter to the cloud centre and zoom.
+        # Cap the shrink at 5x per iteration: a determination that is a lucky underestimate
+        # at a large box would otherwise collapse the box too far, leaving the next
+        # iteration under-determined and forcing a re-grow (oscillation).
+        new_box = max(min(spread * mpf("1.2"), boxsize), boxsize / 5)
 
         # Wander check: give up if the cloud centre has drifted more than an ABSOLUTE
         # distance wander_dist from the grid point we started at.
