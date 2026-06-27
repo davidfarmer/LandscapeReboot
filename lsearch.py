@@ -996,13 +996,39 @@ def _random_ap(primes, scale, n_loc=1, fixed=None):
     return out
 
 
-def _coeff_distance(apA, apB):
-    """Distance between two coefficient solutions, weighted toward the SMALLER primes
-    (which are determined accurately; larger primes carry the numerical noise).  Used to
-    decide whether two candidates are the SAME solution of the system -- so two distinct
-    L-functions that share a (near-)identical spectral point are kept apart by their
-    coefficients."""
-    common = sorted(set(apA) & set(apB))
+_GOLDEN_ANGLE = mpmath.pi * (3 - mpmath.sqrt(5))    # sunflower spacing, ~2.39996 rad
+
+
+def _spread_ap(primes, scale, n_loc, idx, total, fixed=None):
+    """Like _random_ap, but the dominant discriminator a_2 (the first prime's leading
+    coefficient) is placed on a golden-angle 'sunflower' spiral over the disk |a_2| <= scale
+    -- deterministically by idx -- so the restarts COVER the coefficient space and probe
+    the different L-function basins instead of clustering in one.  The rest is random."""
+    out = _random_ap(primes, scale, n_loc, fixed=fixed)
+    fixed = fixed or {}
+    if primes and primes[0] not in fixed:
+        r = scale * mpmath.sqrt(mpf(idx) + mpf("0.5")) / mpmath.sqrt(mpf(max(total, 1)))
+        ang = idx * _GOLDEN_ANGLE
+        out[primes[0]][0] = mpc(r * mpmath.cos(ang), r * mpmath.sin(ang))
+    return out
+
+
+DEDUP_PRIMES = 3        # number of (smallest) primes used to decide if two candidates
+#                         are the same L-function (a_2, a_3, a_5)
+
+
+def _coeff_distance(apA, apB, n_primes=DEDUP_PRIMES):
+    """Distance between two candidate coefficient vectors, restricted to the smallest
+    `n_primes` primes (a_2, a_3, a_5) and weighted toward the smaller ones.  Used to decide
+    whether two exploration candidates are the SAME L-function.
+
+    ONLY the low primes are used: at exploration accuracy the higher-prime coefficients are
+    huge and noisy (far past the Satake bound) and would dominate the distance, so two
+    candidates that converge to the SAME L-point -- agreeing on the well-determined low
+    primes but differing wildly on the noisy high ones -- would otherwise look distinct and
+    both be (wastefully) refined.  Empirically a_2,a_3,a_5 separate the GL(3) forms cleanly:
+    same form <~0.25, different forms >~1.5 (see the exploration logs)."""
+    common = sorted(set(apA) & set(apB))[:n_primes]
     if not common:
         return mpmath.inf
     # per prime: sum |c_j(A) - c_j(B)| over the local-unknown components
@@ -1015,7 +1041,7 @@ def _coeff_distance(apA, apB):
 
 def explore_candidates(landscape, euler, point, boxsize, accuracy, working_precision,
                        restarts=20, guess=None, eps_guess=None, k_min=3, k_max=None,
-                       coeff_tol=mpf("0.05"), max_candidates=5, scale=mpf(2),
+                       coeff_tol=mpf("0.4"), max_candidates=5, scale=mpf(2),
                        deadline=None, verbose=True, trace=False):
     """Find DISTINCT candidate solutions of the system near `point`.
 
@@ -1056,11 +1082,18 @@ def explore_candidates(landscape, euler, point, boxsize, accuracy, working_preci
     sols0 = []
     for k in range(k_min, k_max + 1):
         primes = cand_primes[:k]
-        # seeds: the given guess (known primes + zeros), then random restarts that KEEP
-        # any given coefficients and randomize the rest, then a cold (all-zero) start
+        # seeds: the given guess, then restarts that KEEP any given coefficients and vary
+        # the rest, then a cold (all-zero) start.  Half the restarts place a_2 on a
+        # golden-angle sunflower spiral over its disk (COVER the space -> probe different
+        # L-function basins), the other half are fully random (find structure the grid
+        # misses).  A cold start anchors the all-zero direction.
         nloc = euler.complex_unknowns_per_prime
+        n_spread = restarts // 2
         seeds = ([guess] if guess is not None else []) + \
-                [_random_ap(primes, scale, nloc, fixed=guess) for _ in range(restarts)] + [None]
+                [_spread_ap(primes, scale, nloc, i, n_spread, fixed=guess)
+                 for i in range(n_spread)] + \
+                [_random_ap(primes, scale, nloc, fixed=guess)
+                 for _ in range(restarts - n_spread)] + [None]
         n_before = len(sols0)
         for seed in seeds:
             if deadline is not None and time.time() > deadline:
@@ -1130,7 +1163,7 @@ def explore_candidates(landscape, euler, point, boxsize, accuracy, working_preci
 def search_landscape(landscape, euler, point, boxsize, accuracy, working_precision,
                      target_box, restarts=20, guess=None, eps_guess=None, max_iter=40,
                      wander_dist=mpf("0.25"), timeout=600, refine_coeffs=True,
-                     coeff_tol=mpf("0.05"), max_candidates=5, verbose=False,
+                     coeff_tol=mpf("0.4"), max_candidates=5, verbose=False,
                      on_result=None):
     """Explore near `point` for distinct candidate solutions (varying k and random
     Broyden restarts), then refine EACH distinct candidate into an L-point.  The time
