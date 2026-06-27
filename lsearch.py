@@ -1163,8 +1163,8 @@ def explore_candidates(landscape, euler, point, boxsize, accuracy, working_preci
 def search_landscape(landscape, euler, point, boxsize, accuracy, working_precision,
                      target_box, restarts=20, guess=None, eps_guess=None, max_iter=40,
                      wander_dist=mpf("0.25"), timeout=600, refine_coeffs=True,
-                     coeff_tol=mpf("0.4"), max_candidates=5, verbose=False,
-                     on_result=None):
+                     coeff_tol=mpf("0.4"), max_candidates=5, abandon_patience=6,
+                     verbose=False, on_result=None):
     """Explore near `point` for distinct candidate solutions (varying k and random
     Broyden restarts), then refine EACH distinct candidate into an L-point.  The time
     limit guards only the exploration; refinement of a real candidate runs to completion.
@@ -1199,7 +1199,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
             # it, and the high-accuracy climb to a fine target can take a while
             res = search(landscape, euler, point, boxsize, accuracy, working_precision,
                          target_box, guess=guess, eps_guess=eps_guess, max_iter=max_iter,
-                         wander_dist=wander_dist, timeout=None,
+                         wander_dist=wander_dist, timeout=None, abandon_patience=0,
                          refine_coeffs=refine_coeffs, verbose=verbose)
             res["secs"] = time.time() - t0
             res["candidate"] = 0
@@ -1228,6 +1228,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                      working_precision, target_box, guess=cand["ap"],
                      eps_guess=cand["epsilon"], max_iter=max_iter,
                      wander_dist=wander_dist, timeout=refine_timeout,
+                     abandon_patience=abandon_patience,
                      refine_coeffs=refine_coeffs, verbose=verbose)
         res["secs"] = time.time() - t0
         res["candidate"] = n
@@ -1263,7 +1264,8 @@ def _finalize_coeffs(result, landscape, euler, refine_coeffs, verbose):
 def search(landscape, euler, point, boxsize, accuracy, working_precision, target_box,
            guess=None, eps_guess=None, max_iter=40, wander_dist=mpf("0.25"),
            stall_factor=mpf("0.9"), stall_patience=2, solver="square",
-           refine_coeffs=True, timeout=600, solve_restarts=6, verbose=True):
+           refine_coeffs=True, timeout=600, solve_restarts=6, abandon_patience=6,
+           verbose=True):
     """Iterative search (Steps 1-8): move a triangular box toward an L-function, raising
     the accuracy (to tighten the spectral-parameter cloud) and the working precision (to
     keep the cloud points trustworthy) as the box shrinks.
@@ -1312,6 +1314,7 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
     ln10 = mpmath.log(10)
     acc_max = _acc_max_for_target(target, ln10)   # cap accuracy at what the target needs
     stalls = 0
+    no_shrink = 0                # consecutive iterations without the box shrinking
     refining = False             # cheap exploration until the box first shrinks
     accuracy = acc_floor         # current accuracy, carried across iterations (monotonic)
     prev_det = None              # last iteration's determination (cloud spread)
@@ -1469,6 +1472,20 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
         if not bracketed and boxsize >= wander_dist:
             # grown to the wander limit without bracketing any L-function
             return {"status": "fail", "reason": "no point within range", "iter": it, **last}
+
+        # abandon a candidate that is not making downward progress: too many consecutive
+        # iterations without the box shrinking.  A real form's box shrinks regularly (the
+        # growth phase is only ~4 steps); a spurious exploration candidate grows or holds
+        # without ever zooming, wasting time.  abandon_patience<=0 disables this.
+        if new_box < boxsize * stall_factor:
+            no_shrink = 0
+        else:
+            no_shrink += 1
+            if abandon_patience and no_shrink >= abandon_patience:
+                if verbose:
+                    print(f"   ({no_shrink} steps without the box shrinking -> abandoning "
+                          f"this candidate as not converging)")
+                return {"status": "fail", "reason": "not converging", "iter": it, **last}
 
         # progress / stall: box shrinking -> progress; box held (dead-band) and the
         # determination no longer improving with accuracy -> the detector floor
@@ -1765,6 +1782,15 @@ def _search_report(res, land, a, elapsed):
     elif status == "fail" and reason == "no solution":
         kind = "nosol"
         out.append("OUTCOME: FAILED (no solution) -- could not solve at the start point.")
+    elif status == "fail" and reason == "not converging":
+        kind = "abandoned"
+        out.append("OUTCOME: ABANDONED -- the box went too many steps without shrinking "
+                   "(not converging to an L-function); raise --abandon-after to be more "
+                   "patient.")
+    elif status == "fail" and reason == "no point within range":
+        kind = "norange"
+        out.append("OUTCOME: FAILED (no point in range) -- the box grew to the wander "
+                   "limit without bracketing any L-function.")
     elif status == "timeout":
         if box is not None and box < init_box * mpf("0.999"):
             kind = "partial"
@@ -1897,6 +1923,10 @@ def _search_cli(argv):
     p.add_argument("--max-candidates", type=int, default=5,
                    help="maximum number of distinct candidate solutions to keep from "
                         "exploration and refine (default 5)")
+    p.add_argument("--abandon-after", type=int, default=6,
+                   help="abandon a candidate after this many refinement steps without the "
+                        "box shrinking (it is not converging to an L-function); 0 disables "
+                        "(default 6)")
     p.add_argument("--coeffs", default=None,
                    help="starting Euler coefficients to warm-start from, as a comma list "
                         "a_2,a_3,a_5,a_7,... (positional by prime) and/or 'p:val' tokens, "
@@ -1945,7 +1975,8 @@ def _search_cli(argv):
         land, euler, point, mpf(a.boxsize), a.accuracy, a.working_precision,
         mpf(a.target), restarts=a.restarts, guess=guess, eps_guess=eg,
         max_iter=a.max_iter, wander_dist=mpf(a.wander_dist), timeout=a.timeout,
-        max_candidates=a.max_candidates, verbose=a.verbose, on_result=on_result)
+        max_candidates=a.max_candidates, abandon_patience=a.abandon_after,
+        verbose=a.verbose, on_result=on_result)
     elapsed = time.time() - t0
 
     if not results:
