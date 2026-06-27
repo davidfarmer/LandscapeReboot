@@ -726,8 +726,40 @@ def _cloud_from_corners(systems, sols, point, h, detector_idx, working_precision
     return cloud, cloud_info, lines
 
 
+def _solve_corner(system, guess, eps_guess, deadline, restarts, fixed=None):
+    """Solve at system.point, trying the warm `guess` (the previous iteration's solution)
+    first; if it fails, try up to `restarts` NEARBY starting points -- small perturbations
+    of the warm guess, and keep-the-low-primes / randomize-the-rest restarts -- so a single
+    Broyden divergence at one box step does not abort the whole search.  Returns the
+    solution dict or None.  `fixed` reuses a chosen equation set (corners 1, 2)."""
+    def solve(seed):
+        if fixed is not None:
+            return solve_at_point(system, guess=seed, eps_guess=eps_guess,
+                                  fixed=fixed, deadline=deadline)
+        return solve_at_point(system, guess=seed, eps_guess=eps_guess, deadline=deadline)
+
+    sol = solve(guess)
+    if sol is not None or restarts <= 0:
+        return sol
+    nloc = system.euler.complex_unknowns_per_prime
+    primes = fixed[2] if fixed is not None else system.primes
+    low = {p: guess[p] for p in list(primes)[:3] if p in guess} if guess else {}
+    for i in range(restarts):
+        if deadline is not None and time.time() > deadline:
+            break
+        if guess and i % 2 == 0:                  # a nearby point: perturb the warm guess
+            seed = {p: [c + _rand_c(mpf("0.3")) for c in guess[p]] for p in guess}
+        else:                                     # keep the low primes, randomize the rest
+            seed = _random_ap(primes, mpf(2), nloc, fixed=low)
+        sol = solve(seed)
+        if sol is not None:
+            return sol
+    return sol
+
+
 def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
-             guess=None, eps_guess=None, solver="square", deadline=None, verbose=False):
+             guess=None, eps_guess=None, solver="square", deadline=None, verbose=False,
+             solve_restarts=0):
     """One box iteration's geometry: returns the corner solutions, the detector
     lines, and the candidate cloud (Step 4-6).
 
@@ -745,7 +777,7 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
     timed_out = lambda: deadline is not None and time.time() > deadline
 
     sys0 = build_equation_system(landscape, euler, corners[0], accuracy, working_precision)
-    sol0 = solve_at_point(sys0, guess=guess, eps_guess=eps_guess, deadline=deadline)
+    sol0 = _solve_corner(sys0, guess, eps_guess, deadline, solve_restarts)
     if sol0 is None or timed_out():
         return None
     k = sol0["k"]
@@ -761,8 +793,8 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
             return None
         sysc = build_equation_system(landscape, euler, c, accuracy, working_precision,
                                      weight_set=weights)
-        solc = solve_at_point(sysc, guess=sol0["ap"], eps_guess=sol0["epsilon"],
-                              fixed=fixed, deadline=deadline)
+        solc = _solve_corner(sysc, sol0["ap"], sol0["epsilon"], deadline, solve_restarts,
+                             fixed=fixed)
         if solc is None:            # a corner solve failed -> cannot form the geometry
             return None
         systems.append(sysc)
@@ -1198,7 +1230,7 @@ def _finalize_coeffs(result, landscape, euler, refine_coeffs, verbose):
 def search(landscape, euler, point, boxsize, accuracy, working_precision, target_box,
            guess=None, eps_guess=None, max_iter=40, wander_dist=mpf("0.25"),
            stall_factor=mpf("0.9"), stall_patience=2, solver="square",
-           refine_coeffs=True, timeout=600, verbose=True):
+           refine_coeffs=True, timeout=600, solve_restarts=6, verbose=True):
     """Iterative search (Steps 1-8): move a triangular box toward an L-function, raising
     the accuracy (to tighten the spectral-parameter cloud) and the working precision (to
     keep the cloud points trustworthy) as the box shrinks.
@@ -1288,7 +1320,8 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
             mp.dps = wp
             bs = box_step(landscape, euler, point, boxsize, int(round(accuracy)), wp,
                           guess=g, eps_guess=eg, solver=solver,
-                          deadline=(None if refining else deadline), verbose=False)
+                          deadline=(None if refining else deadline), verbose=False,
+                          solve_restarts=solve_restarts)
             if _timed_out():
                 return {"status": "timeout", "reason": "time limit", "iter": it,
                         **(last or {"point": point})}
