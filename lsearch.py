@@ -1363,13 +1363,19 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
     refining = False             # cheap exploration until the box first shrinks
     accuracy = acc_floor         # current accuracy, carried across iterations (monotonic)
     prev_det = None              # last iteration's determination (cloud spread)
+    prev_det_res = None          # last iteration's detector residual (closeness to a form)
+    det_falling = True           # is the detector residual still decreasing? (homing in)
     last = None                  # last accepted (center, new_box, wp, cloud_prec, sol)
     deadline = (time.time() + timeout) if timeout else None
 
     def _timed_out():
-        # the time limit only guards the search for an INITIAL solution; once the box has
-        # shrunk (refining), a genuine candidate is being polished -- never abandon it
-        return deadline is not None and not refining and time.time() > deadline
+        # The time limit only guards the search for an INITIAL solution.  It does NOT fire
+        # once the box has shrunk (refining -- a genuine candidate is being polished), nor
+        # while the detector residual is still falling (the candidate is homing onto a form
+        # even if the box has not yet bracketed it -- e.g. the slow growth phase at large
+        # spectral parameters), since cutting that off would abandon a real L-function.
+        return (deadline is not None and not refining and not det_falling
+                and time.time() > deadline)
 
     for it in range(max_iter):
         if _timed_out():         # ran out of wall-clock time without a solution
@@ -1454,6 +1460,9 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
 
         cloud_prec = estimate_cloud_precision(bs)
         det_res = max((s["det_res"] for s in bs["sols"] if s), default=mpf(0))
+        # is the detector residual still falling? (homing onto a form -> don't time out)
+        det_falling = (prev_det_res is None or det_res < prev_det_res * mpf("0.97"))
+        prev_det_res = det_res
         sol = _average_solution(bs["sols"])
         if verbose:
             _report_iteration(it, center, spread, cloud_prec, accuracy, wp,
