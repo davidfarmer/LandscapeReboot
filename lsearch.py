@@ -1163,8 +1163,8 @@ def explore_candidates(landscape, euler, point, boxsize, accuracy, working_preci
 def search_landscape(landscape, euler, point, boxsize, accuracy, working_precision,
                      target_box, restarts=20, guess=None, eps_guess=None, max_iter=40,
                      wander_dist=mpf("0.25"), timeout=600, refine_coeffs=True,
-                     coeff_tol=mpf("0.4"), max_candidates=5, abandon_patience=6,
-                     verbose=False, on_result=None):
+                     coeff_tol=mpf("0.4"), max_candidates=5, n_explore=12,
+                     sharpen_iters=1, abandon_patience=6, verbose=False, on_result=None):
     """Explore near `point` for distinct candidate solutions (varying k and random
     Broyden restarts), then refine EACH distinct candidate into an L-point.  The time
     limit guards only the exploration; refinement of a real candidate runs to completion.
@@ -1214,17 +1214,62 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
     explore_deadline = None if guess is not None else deadline
     refine_timeout = None if guess is not None else timeout
 
-    # the candidate list (spectral points AND coefficients) is always shown
+    # (1) explore BROADLY for a pool of initial candidates (n_explore, more than we will
+    # finally refine, so more true L-points can be found).  The full candidate list with
+    # coefficients is shown.
     cands = explore_candidates(landscape, euler, point, boxsize, explore_acc, explore_wp,
                                restarts=restarts, guess=guess, eps_guess=eps_guess,
-                               coeff_tol=coeff_tol, max_candidates=max_candidates,
+                               coeff_tol=coeff_tol, max_candidates=n_explore,
                                deadline=explore_deadline, verbose=True, trace=verbose)
+
+    # (2) do ONE (sharpen_iters) refinement iteration on each candidate to sharpen its
+    # centre and coefficients (the raw exploration coefficients are noisy), then
+    # de-duplicate the sharpened candidates with the coefficient criterion -- collapsing
+    # those that are the same L-function -- BEFORE the expensive full refinement.
+    if cands:
+        print(f"  sharpening {len(cands)} candidate(s) ({sharpen_iters} iteration each), "
+              f"then de-duplicating ...")
+    sharp = []
+    for cand in cands:
+        r = search(landscape, euler, cand["center"], boxsize, accuracy, working_precision,
+                   target_box, guess=cand["ap"], eps_guess=cand["epsilon"],
+                   max_iter=sharpen_iters, wander_dist=wander_dist, timeout=refine_timeout,
+                   abandon_patience=0, refine_coeffs=False, verbose=False)
+        sol = r.get("sol")
+        if sol is None or r.get("point") is None:
+            continue
+        if r.get("status") == "success":      # already converged in the sharpening step
+            r["secs"] = 0.0
+        sharp.append({"center": r["point"], "ap": sol["ap"], "epsilon": sol["epsilon"],
+                      "det": r.get("det_res", mpf(1)), "box": r.get("box", boxsize),
+                      "result": r if r.get("status") == "success" else None})
+
+    sharp.sort(key=lambda s: s["det"])         # keep the lowest-detector representative
+    distinct = []
+    for s in sharp:
+        if any(_coeff_distance(s["ap"], r["ap"]) < coeff_tol for r in distinct):
+            continue
+        distinct.append(s)
+        if len(distinct) >= max_candidates:
+            break
+    print(f"  {len(distinct)} distinct candidate(s) after de-duplication "
+          f"(from {len(cands)} explored):")
+    for n, c in enumerate(distinct):
+        print(f"    candidate {n}: center=({mpmath.nstr(c['center'][0],10)}, "
+              f"{mpmath.nstr(c['center'][1],10)})  det={mpmath.nstr(c['det'],2)}")
+        for p in sorted(c["ap"]):
+            comps = c["ap"][p]
+            vals = ", ".join(mpmath.nstr(x, 8) for x in comps)
+            lbl = f"a_{p}" if len(comps) == 1 else f"p={p}"
+            print(f"        {lbl} = {vals}")
+
+    # (3) fully refine each distinct candidate (continuing from the sharpened state)
     results = []
-    for n, cand in enumerate(cands):
+    for n, cand in enumerate(distinct):
         print(f"  === refining candidate {n} at ({mpmath.nstr(cand['center'][0],10)}, "
               f"{mpmath.nstr(cand['center'][1],10)}) ===")
         t0 = time.time()
-        res = search(landscape, euler, cand["center"], boxsize, accuracy,
+        res = search(landscape, euler, cand["center"], cand["box"], accuracy,
                      working_precision, target_box, guess=cand["ap"],
                      eps_guess=cand["epsilon"], max_iter=max_iter,
                      wander_dist=wander_dist, timeout=refine_timeout,
@@ -1927,6 +1972,13 @@ def _search_cli(argv):
                    help="abandon a candidate after this many refinement steps without the "
                         "box shrinking (it is not converging to an L-function); 0 disables "
                         "(default 6)")
+    p.add_argument("--explore-candidates", type=int, default=12,
+                   help="number of initial candidates to keep from exploration (more lets "
+                        "more true L-points be found); each is sharpened by one iteration "
+                        "and de-duplicated before the full refinement (default 12)")
+    p.add_argument("--sharpen-iters", type=int, default=1,
+                   help="refinement iterations used to sharpen each initial candidate "
+                        "before de-duplication (default 1)")
     p.add_argument("--coeffs", default=None,
                    help="starting Euler coefficients to warm-start from, as a comma list "
                         "a_2,a_3,a_5,a_7,... (positional by prime) and/or 'p:val' tokens, "
@@ -1975,7 +2027,8 @@ def _search_cli(argv):
         land, euler, point, mpf(a.boxsize), a.accuracy, a.working_precision,
         mpf(a.target), restarts=a.restarts, guess=guess, eps_guess=eg,
         max_iter=a.max_iter, wander_dist=mpf(a.wander_dist), timeout=a.timeout,
-        max_candidates=a.max_candidates, abandon_patience=a.abandon_after,
+        max_candidates=a.max_candidates, n_explore=a.explore_candidates,
+        sharpen_iters=a.sharpen_iters, abandon_patience=a.abandon_after,
         verbose=a.verbose, on_result=on_result)
     elapsed = time.time() - t0
 
