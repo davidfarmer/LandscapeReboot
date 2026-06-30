@@ -689,22 +689,35 @@ def _lsq_core(system, primes, fit_idx, x0, tol, maxiter, damping=mpf("1e-30")):
 # and take the line where it is 0.  Intersect the detector lines pairwise -> a cloud
 # of candidate points, which should concentrate at the true (lambda1, lambda2).
 
-def triangle_corners(point, h):
-    """Right-triangle corners: P, P+(h,0), P+(0,h)."""
+def triangle_corners(point, h, angle=0):
+    """Right-triangle corners P, P+h*u, P+h*v, where (u, v) is the orthonormal pair
+    e1, e2 ROTATED by `angle` about the centre P:  u = (cos a, sin a),
+    v = (-sin a, cos a).  angle=0 gives the original axis-aligned P, P+(h,0), P+(0,h).
+    Rotating the stencil samples the detectors along different directions, which changes
+    the affine-fit/cloud geometry (the detectors are only locally affine) and can break an
+    orientation-dependent bias that makes the cloud overshoot."""
     h = mpf(h)
     p = (mpf(point[0]), mpf(point[1]))
-    return [p, (p[0] + h, p[1]), (p[0], p[1] + h)]
+    if angle == 0:
+        return [p, (p[0] + h, p[1]), (p[0], p[1] + h)]
+    ca, sa = mpmath.cos(angle), mpmath.sin(angle)
+    return [p, (p[0] + h * ca, p[1] + h * sa), (p[0] - h * sa, p[1] + h * ca)]
 
 
-def _cloud_from_corners(systems, sols, point, h, detector_idx, working_precision):
-    """From the corner solutions, affinely model each detector over the box and
-    intersect the zero-lines pairwise into a candidate cloud.  Returns
-    (cloud, cloud_info, lines)."""
+def _cloud_from_corners(systems, sols, point, h, detector_idx, working_precision, angle=0):
+    """From the corner solutions, affinely model each detector over the box and intersect
+    the zero-lines pairwise into a candidate cloud.  Returns (cloud, cloud_info, lines).
+
+    With a rotated stencil (`angle`, see triangle_corners) the solved offsets (d1, d2) are
+    coordinates in the rotated (u, v) basis, so they are rotated back to Cartesian for the
+    cloud point: offset = d1*u + d2*v."""
+    ca, sa = (mpmath.cos(angle), mpmath.sin(angle)) if angle else (mpf(1), mpf(0))
     Dvals = []
     for i in range(3):
         full = residual(systems[i], sols[i]["x"], primes=sols[i]["primes"])
         Dvals.append([full[d] for d in detector_idx])
-    # affine model of each detector: D(d1,d2) = D0 + g1 d1 + g2 d2  (d = offset from P)
+    # affine model of each detector: D(d1,d2) = D0 + g1 d1 + g2 d2  (d = offset in the
+    # rotated u,v basis: g1 = dD/du, g2 = dD/dv)
     lines = []
     for d in range(len(detector_idx)):
         D0, D1, D2 = Dvals[0][d], Dvals[1][d], Dvals[2][d]
@@ -720,9 +733,11 @@ def _cloud_from_corners(systems, sols, point, h, detector_idx, working_precision
                 continue                        # near-parallel -> unstable, skip
             d1 = (-D0i * g2j + g2i * D0j) / det
             d2 = (-g1i * D0j + g1j * D0i) / det
+            ox = d1 * ca - d2 * sa              # rotate (u,v) coords back to Cartesian
+            oy = d1 * sa + d2 * ca
             Minv_norm = max(abs(g2j) + abs(g2i), abs(g1j) + abs(g1i)) / abs(det)
-            cloud.append((point[0] + d1, point[1] + d2))
-            cloud_info.append({"offset": max(abs(d1), abs(d2)), "Minv": Minv_norm})
+            cloud.append((point[0] + ox, point[1] + oy))
+            cloud_info.append({"offset": max(abs(ox), abs(oy)), "Minv": Minv_norm})
     return cloud, cloud_info, lines
 
 
@@ -759,7 +774,7 @@ def _solve_corner(system, guess, eps_guess, deadline, restarts, fixed=None):
 
 def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
              guess=None, eps_guess=None, solver="square", deadline=None, verbose=False,
-             solve_restarts=0):
+             solve_restarts=0, angle=0):
     """One box iteration's geometry: returns the corner solutions, the detector
     lines, and the candidate cloud (Step 4-6).
 
@@ -772,7 +787,7 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
     geometry), so it is not the default.  LSQ's real value is sharper COEFFICIENTS at a
     known point -- see search(refine_coeffs=...)."""
     h = mpf(boxsize)
-    corners = triangle_corners(point, h)
+    corners = triangle_corners(point, h, angle)
 
     timed_out = lambda: deadline is not None and time.time() > deadline
 
@@ -816,7 +831,7 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
 
     # detector zero-lines from the 3 corners, intersected pairwise into a cloud
     cloud, cloud_info, lines = _cloud_from_corners(
-        systems, sols, point, h, detector_idx, working_precision)
+        systems, sols, point, h, detector_idx, working_precision, angle)
 
     # precision lost in recovering the coefficients (solve conditioning at corner 0)
     cond_solve = sol0["cond"]
@@ -1310,7 +1325,7 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
            guess=None, eps_guess=None, max_iter=40, wander_dist=mpf("0.25"),
            stall_factor=mpf("0.9"), stall_patience=2, solver="square",
            refine_coeffs=True, timeout=600, solve_restarts=6, abandon_patience=6,
-           verbose=True):
+           box_angle_step=mpf("2.39996"), verbose=True):
     """Iterative search (Steps 1-8): move a triangular box toward an L-function, raising
     the accuracy (to tighten the spectral-parameter cloud) and the working precision (to
     keep the cloud points trustworthy) as the box shrinks.
@@ -1399,10 +1414,15 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
                 return {"status": "timeout", "reason": "time limit", "iter": it,
                         **(last or {"point": point})}
             mp.dps = wp
+            # Rotate the box stencil by the golden angle (~137.5 deg) every iteration, so
+            # successive orientations overlap as little as possible (the sunflower spacing).
+            # Sampling the detectors along ever-different directions averages out an
+            # orientation-dependent cloud bias rather than letting it drive a persistent
+            # overshoot / wander.  box_angle_step=0 keeps the fixed axis-aligned stencil.
             bs = box_step(landscape, euler, point, boxsize, int(round(accuracy)), wp,
                           guess=g, eps_guess=eg, solver=solver,
                           deadline=(None if refining else deadline), verbose=False,
-                          solve_restarts=solve_restarts)
+                          solve_restarts=solve_restarts, angle=box_angle_step * it)
             if _timed_out():
                 return {"status": "timeout", "reason": "time limit", "iter": it,
                         **(last or {"point": point})}
