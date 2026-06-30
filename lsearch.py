@@ -1179,7 +1179,8 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                      target_box, restarts=20, guess=None, eps_guess=None, max_iter=40,
                      wander_dist=mpf("0.25"), timeout=600, refine_coeffs=True,
                      coeff_tol=mpf("0.4"), max_candidates=5, n_explore=12,
-                     sharpen_iters=1, abandon_patience=6, verbose=False, on_result=None):
+                     sharpen_iters=1, abandon_patience=6, explore_wp_cap=0,
+                     verbose=False, on_result=None):
     """Explore near `point` for distinct candidate solutions (varying k and random
     Broyden restarts), then refine EACH distinct candidate into an L-point.  The time
     limit guards only the exploration; refinement of a real candidate runs to completion.
@@ -1196,6 +1197,8 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
     refining, so the caller can report results incrementally rather than only at the end."""
     explore_acc = int(round(mpf(accuracy)))
     explore_wp = max(int(working_precision), 2 * explore_acc + 20)
+    if explore_wp_cap:                     # limit the working precision while exploring
+        explore_wp = min(explore_wp, explore_wp_cap)
     deadline = (time.time() + timeout) if timeout else None
 
     # Full resume: the supplied coefficients already cover the significant primes -> just
@@ -1215,6 +1218,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
             res = search(landscape, euler, point, boxsize, accuracy, working_precision,
                          target_box, guess=guess, eps_guess=eps_guess, max_iter=max_iter,
                          wander_dist=wander_dist, timeout=None, abandon_patience=0,
+                         explore_wp_cap=explore_wp_cap,
                          refine_coeffs=refine_coeffs, verbose=verbose)
             res["secs"] = time.time() - t0
             res["candidate"] = 0
@@ -1249,7 +1253,8 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
         r = search(landscape, euler, cand["center"], boxsize, accuracy, working_precision,
                    target_box, guess=cand["ap"], eps_guess=cand["epsilon"],
                    max_iter=sharpen_iters, wander_dist=wander_dist, timeout=refine_timeout,
-                   abandon_patience=0, refine_coeffs=False, verbose=False)
+                   abandon_patience=0, explore_wp_cap=explore_wp_cap,
+                   refine_coeffs=False, verbose=False)
         sol = r.get("sol")
         if sol is None or r.get("point") is None:
             continue
@@ -1288,7 +1293,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                      working_precision, target_box, guess=cand["ap"],
                      eps_guess=cand["epsilon"], max_iter=max_iter,
                      wander_dist=wander_dist, timeout=refine_timeout,
-                     abandon_patience=abandon_patience,
+                     abandon_patience=abandon_patience, explore_wp_cap=explore_wp_cap,
                      refine_coeffs=refine_coeffs, verbose=verbose)
         res["secs"] = time.time() - t0
         res["candidate"] = n
@@ -1325,7 +1330,7 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
            guess=None, eps_guess=None, max_iter=40, wander_dist=mpf("0.25"),
            stall_factor=mpf("0.9"), stall_patience=2, solver="square",
            refine_coeffs=True, timeout=600, solve_restarts=6, abandon_patience=6,
-           box_angle_step=mpf("2.39996"), verbose=True):
+           box_angle_step=mpf("2.39996"), explore_wp_cap=0, verbose=True):
     """Iterative search (Steps 1-8): move a triangular box toward an L-function, raising
     the accuracy (to tighten the spectral-parameter cloud) and the working precision (to
     keep the cloud points trustworthy) as the box shrinks.
@@ -1431,14 +1436,21 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
                 center, spread = cloud_center_spread(bs["cloud"])
                 good = (bs, center, spread, cond, wp)      # remember this success
                 need = int(mpmath.ceil(accuracy + mpmath.log(cond) / ln10 + GUARD_DIGITS))
-                if wp >= need:
-                    break                              # good step at adequate precision
-                new_wp = need + 3   # 3 digits of headroom so we don't redo again at once
+                # While still GROWING (not refining) the cloud centre is only a rough
+                # direction, so don't chase an ill-conditioned off-form solve to high
+                # working precision (that is what causes runaway rebuilds) -- cap wp at
+                # explore_wp_cap and accept the rougher cloud; the cap lifts once refining.
+                cap = explore_wp_cap if (explore_wp_cap and not refining) else None
+                target = min(need, cap) if cap else need
+                if wp >= target:
+                    break                              # adequate precision (or capped)
+                new_wp = min(need + 3, cap) if cap else need + 3
                 if verbose:         # show the provisional guess so a redo isn't a silent wait
                     print(f"   provisional guess: L-point=({mpmath.nstr(center[0], 12)}, "
                           f"{mpmath.nstr(center[1], 12)})  box size={mpmath.nstr(boxsize, 2)}")
+                    capnote = f" (capped at {cap} while exploring)" if cap and need > cap else ""
                     print(f"   (redo: wp {wp} < accuracy+log10(cond)+{GUARD_DIGITS} = "
-                          f"{need} -> raising wp to {new_wp})")
+                          f"{need} -> raising wp to {new_wp}{capnote})")
                 wp = new_wp
                 continue
             # no cloud at this wp.  If a LOWER-wp step already succeeded this iteration, a
@@ -1999,6 +2011,11 @@ def _search_cli(argv):
     p.add_argument("--sharpen-iters", type=int, default=1,
                    help="refinement iterations used to sharpen each initial candidate "
                         "before de-duplication (default 1)")
+    p.add_argument("--explore-wp", type=int, default=0,
+                   help="cap the working precision while EXPLORING (growing the box before "
+                        "it brackets a point), where the cloud centre is only a rough "
+                        "direction -- avoids runaway rebuilds chasing an ill-conditioned "
+                        "off-form solve to high precision; 0 = no cap (default)")
     p.add_argument("--coeffs", default=None,
                    help="starting Euler coefficients to warm-start from, as a comma list "
                         "a_2,a_3,a_5,a_7,... (positional by prime) and/or 'p:val' tokens, "
@@ -2049,7 +2066,7 @@ def _search_cli(argv):
         max_iter=a.max_iter, wander_dist=mpf(a.wander_dist), timeout=a.timeout,
         max_candidates=a.max_candidates, n_explore=a.explore_candidates,
         sharpen_iters=a.sharpen_iters, abandon_patience=a.abandon_after,
-        verbose=a.verbose, on_result=on_result)
+        explore_wp_cap=a.explore_wp, verbose=a.verbose, on_result=on_result)
     elapsed = time.time() - t0
 
     if not results:
