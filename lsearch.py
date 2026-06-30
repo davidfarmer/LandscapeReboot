@@ -1413,7 +1413,8 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
         #  * box too big: if even at ample wp there is still no cloud, the corners are too
         #    far apart to solve -> shrink the box and retry.
         bs = cond = center = spread = None
-        good = None      # last SUCCESSFUL (bs, center, spread, cond, wp) this iteration
+        good = None      # last SUCCESSFUL (bs, center, spread, cond, wp, rough) this iter
+        rough = False    # accepted step at capped, under-precision wp -> spread untrustworthy
         for attempt in range(12):
             if _timed_out():
                 return {"status": "timeout", "reason": "time limit", "iter": it,
@@ -1434,16 +1435,19 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
             if bs is not None and bs["cloud"]:
                 cond = bs["cond_solve"]
                 center, spread = cloud_center_spread(bs["cloud"])
-                good = (bs, center, spread, cond, wp)      # remember this success
                 need = int(mpmath.ceil(accuracy + mpmath.log(cond) / ln10 + GUARD_DIGITS))
+                good = (bs, center, spread, cond, wp, wp < need)   # (..., rough?)
                 # While still GROWING (not refining) the cloud centre is only a rough
                 # direction, so don't chase an ill-conditioned off-form solve to high
                 # working precision (that is what causes runaway rebuilds) -- cap wp at
                 # explore_wp_cap and accept the rougher cloud; the cap lifts once refining.
+                # A capped step (wp < need) is "rough": its determination is untrustworthy,
+                # so it is used for DIRECTION only (grow, never shrink/succeed -- below).
                 cap = explore_wp_cap if (explore_wp_cap and not refining) else None
-                target = min(need, cap) if cap else need
-                if wp >= target:
-                    break                              # adequate precision (or capped)
+                wp_target = min(need, cap) if cap else need
+                if wp >= wp_target:
+                    rough = wp < need                  # accepted a capped, under-precision step
+                    break
                 new_wp = min(need + 3, cap) if cap else need + 3
                 if verbose:         # show the provisional guess so a redo isn't a silent wait
                     print(f"   provisional guess: L-point=({mpmath.nstr(center[0], 12)}, "
@@ -1458,7 +1462,7 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
             # solve can diverge at a higher wp); fall back to that good step rather than
             # discarding it.
             if good is not None:
-                bs, center, spread, cond, wp = good
+                bs, center, spread, cond, wp, rough = good
                 if verbose:
                     print(f"   (higher-precision redo failed; keeping the wp {wp} step)")
                 break
@@ -1503,15 +1507,23 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
         # the determination SMOOTHLY rather than flip-flopping between grow and zoom when
         # the determination hovers near the box size (the oscillation that wandered off and
         # failed on a cold start).
-        desired = spread * BOX_MARGIN
-        if desired > boxsize * BOX_DEADBAND:           # under-determined -> grow
-            new_box = min(desired, boxsize * BOX_GROW, wander_dist)
-        elif desired < boxsize / BOX_DEADBAND:         # over-determined -> shrink (zoom)
-            new_box = max(desired, boxsize / BOX_SHRINK)
+        if rough:
+            # the step was at capped, under-precision wp -> the determination (spread) is
+            # untrustworthy.  Use the cloud centre for DIRECTION only: GROW toward bracketing
+            # and recenter, but never shrink the box toward target or declare success on it.
+            # Near a form the conditioning improves, need drops below the cap, the step
+            # becomes trustworthy, and the zoom + success proceed at full precision.
+            new_box = min(boxsize * BOX_GROW, wander_dist)
+            bracketed = False
         else:
-            new_box = boxsize                          # dead-band: hold
-
-        bracketed = spread < boxsize                   # cloud centre a valid interpolation?
+            desired = spread * BOX_MARGIN
+            if desired > boxsize * BOX_DEADBAND:       # under-determined -> grow
+                new_box = min(desired, boxsize * BOX_GROW, wander_dist)
+            elif desired < boxsize / BOX_DEADBAND:     # over-determined -> shrink (zoom)
+                new_box = max(desired, boxsize / BOX_SHRINK)
+            else:
+                new_box = boxsize                      # dead-band: hold
+            bracketed = spread < boxsize               # cloud centre a valid interpolation?
 
         # Recenter toward the cloud centre, damped: cap the move at RECENTER_CAP box sizes.
         # While under-determined the centre is a long, noisy extrapolation and the cap (a
