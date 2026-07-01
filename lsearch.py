@@ -1056,7 +1056,7 @@ def _coeff_distance(apA, apB, n_primes=DEDUP_PRIMES):
 
 def explore_candidates(landscape, euler, point, boxsize, accuracy, working_precision,
                        restarts=20, guess=None, eps_guess=None, k_min=3, k_max=None,
-                       coeff_tol=mpf("0.4"), max_candidates=5, scale=mpf(2),
+                       coeff_tol=mpf("0.4"), max_candidates=5, scale=mpf(3),
                        deadline=None, verbose=True, trace=False):
     """Find DISTINCT candidate solutions of the system near `point`.
 
@@ -1180,7 +1180,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                      wander_dist=mpf("0.25"), timeout=600, refine_coeffs=True,
                      coeff_tol=mpf("0.4"), max_candidates=5, n_explore=12,
                      sharpen_iters=1, abandon_patience=6, explore_wp_cap=0,
-                     verbose=False, on_result=None):
+                     scale=mpf(3), verbose=False, on_result=None):
     """Explore near `point` for distinct candidate solutions (varying k and random
     Broyden restarts), then refine EACH distinct candidate into an L-point.  The time
     limit guards only the exploration; refinement of a real candidate runs to completion.
@@ -1238,7 +1238,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
     # coefficients is shown.
     cands = explore_candidates(landscape, euler, point, boxsize, explore_acc, explore_wp,
                                restarts=restarts, guess=guess, eps_guess=eps_guess,
-                               coeff_tol=coeff_tol, max_candidates=n_explore,
+                               coeff_tol=coeff_tol, max_candidates=n_explore, scale=scale,
                                deadline=explore_deadline, verbose=True, trace=verbose)
 
     # (2) do ONE (sharpen_iters) refinement iteration on each candidate to sharpen its
@@ -2028,6 +2028,10 @@ def _search_cli(argv):
                         "it brackets a point), where the cloud centre is only a rough "
                         "direction -- avoids runaway rebuilds chasing an ill-conditioned "
                         "off-form solve to high precision; 0 = no cap (default)")
+    p.add_argument("--coeff-scale", default="3",
+                   help="radius of the coefficient disk sampled in exploration (a_p random "
+                        "restarts and the a_2 sunflower); the Satake bound is 3, so 3 covers "
+                        "the full range -- forms with a large |a_2| need this (default 3)")
     p.add_argument("--coeffs", default=None,
                    help="starting Euler coefficients to warm-start from, as a comma list "
                         "a_2,a_3,a_5,a_7,... (positional by prime) and/or 'p:val' tokens, "
@@ -2078,7 +2082,8 @@ def _search_cli(argv):
         max_iter=a.max_iter, wander_dist=mpf(a.wander_dist), timeout=a.timeout,
         max_candidates=a.max_candidates, n_explore=a.explore_candidates,
         sharpen_iters=a.sharpen_iters, abandon_patience=a.abandon_after,
-        explore_wp_cap=a.explore_wp, verbose=a.verbose, on_result=on_result)
+        explore_wp_cap=a.explore_wp, scale=mpf(a.coeff_scale),
+        verbose=a.verbose, on_result=on_result)
     elapsed = time.time() - t0
 
     if not results:
