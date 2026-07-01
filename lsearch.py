@@ -1179,7 +1179,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                      target_box, restarts=20, guess=None, eps_guess=None, max_iter=40,
                      wander_dist=mpf("0.25"), timeout=600, refine_coeffs=True,
                      coeff_tol=mpf("0.4"), max_candidates=5, n_explore=12,
-                     sharpen_iters=1, abandon_patience=6, explore_wp_cap=0,
+                     sharpen_iters=1, abandon_patience=6, explore_wp_cap=-1,
                      scale=mpf(3), verbose=False, on_result=None):
     """Explore near `point` for distinct candidate solutions (varying k and random
     Broyden restarts), then refine EACH distinct candidate into an L-point.  The time
@@ -1197,7 +1197,12 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
     refining, so the caller can report results incrementally rather than only at the end."""
     explore_acc = int(round(mpf(accuracy)))
     explore_wp = max(int(working_precision), 2 * explore_acc + 20)
-    if explore_wp_cap:                     # limit the working precision while exploring
+    # cap the working precision while exploring (growth phase) by default -- <0 means AUTO
+    # (exploration wp + a margin: enough for a real form's off-form growth, capping the
+    # ill-conditioned runaway); 0 disables; a positive value is an absolute cap.
+    if explore_wp_cap < 0:
+        explore_wp_cap = explore_wp + 12
+    if explore_wp_cap:
         explore_wp = min(explore_wp, explore_wp_cap)
     deadline = (time.time() + timeout) if timeout else None
 
@@ -2023,11 +2028,12 @@ def _search_cli(argv):
     p.add_argument("--sharpen-iters", type=int, default=1,
                    help="refinement iterations used to sharpen each initial candidate "
                         "before de-duplication (default 1)")
-    p.add_argument("--explore-wp", type=int, default=0,
+    p.add_argument("--explore-wp", type=int, default=-1,
                    help="cap the working precision while EXPLORING (growing the box before "
                         "it brackets a point), where the cloud centre is only a rough "
                         "direction -- avoids runaway rebuilds chasing an ill-conditioned "
-                        "off-form solve to high precision; 0 = no cap (default)")
+                        "off-form solve to high precision.  -1 = auto (exploration wp + 12, "
+                        "the default), 0 = no cap, N = absolute cap")
     p.add_argument("--coeff-scale", default="3",
                    help="radius of the coefficient disk sampled in exploration (a_p random "
                         "restarts and the a_2 sunflower); the Satake bound is 3, so 3 covers "
