@@ -102,22 +102,27 @@ def admissibility_bound(landscape):
     return mpmath.pi / 2 * (mpf(n_R) / 2 + n_C)
 
 
-def _beta_values(beta_max):
-    """Phases from beta_max down to 0 (and negatives), spaced FINER near beta_max
-    (close, large beta still give distinct equations; small beta that are close give
-    nearly identical ones)."""
+def _beta_values(beta_max, beta_max_minus=None):
+    """Phases spaced FINER near the ends (close, large |beta| still give distinct
+    equations; small beta that are close give nearly identical ones).  The + and - sides
+    have INDEPENDENT bounds: beta ranges over [0, beta_max] on the + side and [0,
+    beta_max_minus] (default beta_max) on the - side.  Asymmetric because M explodes near
+    the admissibility bound at a different |beta| for +beta than -beta when the spectral
+    parameters are asymmetric; beta_max_minus=0 gives NON-NEGATIVE beta only (self-dual)."""
+    if beta_max_minus is None:
+        beta_max_minus = beta_max
     frac = [mpf(f) for f in ("1.0", "0.93", "0.86", "0.78", "0.68", "0.55", "0.38", "0.18")]
-    vals = [beta_max * f for f in frac] + [mpf(0)]
-    out = []
-    for v in vals:
-        out.append(v)
-        if v != 0:
-            out.append(-v)
+    out = [mpf(0)]
+    for f in frac:
+        if beta_max > 0:
+            out.append(beta_max * f)
+        if beta_max_minus > 0:
+            out.append(-beta_max_minus * f)
     return out
 
 
-def default_weight_set(n_weights, beta_max=mpf("1.5"), alphas=(mpf(0), mpf("0.02")),
-                       m_max=5):
+def default_weight_set(n_weights, beta_max=mpf("1.5"), beta_max_minus=None,
+                       alphas=(mpf(0), mpf("0.02")), m_max=5):
     """A DIVERSE pool of weights g(s)=s^m exp(i*beta*s + alpha*s^2) spanning a grid in
     (m, alpha, beta) -- the diversity is what makes the equations independent enough to
     resolve many Euler coefficients.  The solve then picks a well-conditioned subset
@@ -128,7 +133,7 @@ def default_weight_set(n_weights, beta_max=mpf("1.5"), alphas=(mpf(0), mpf("0.02
     so a small alpha is essentially free here.  beta is kept >= ~1 below the
     admissibility bound (nearer the bound the integrand decays slowly and M explodes);
     larger |beta| are spaced finer (see _beta_values)."""
-    betas = _beta_values(beta_max)
+    betas = _beta_values(beta_max, beta_max_minus)
     alphas = [mpc(a) for a in alphas]
     grid = [(m, al, b) for m in range(m_max + 1) for al in alphas for b in betas]
     if n_weights >= len(grid):
@@ -228,19 +233,75 @@ def unpack_unknowns(u, primes, n_loc=1):
     return epsilon, ap
 
 
+def _size_M(landscape, mu, nu, poles, beta, accuracy, working_precision, contour_nu, M_LIMIT):
+    """Dirichlet length M for a single weight of phase `beta`, capped at M_LIMIT."""
+    return coefficient_relation(FIXED_S, mu=mu, nu=nu, N=landscape.conductor, epsilon=1,
+                                poles=list(poles), g_m=0, g_alpha=0, g_beta=beta,
+                                accuracy=accuracy, working_precision=working_precision,
+                                contour_nu=contour_nu, max_terms=M_LIMIT).num_terms
+
+
+def _beta_limits(landscape, point, accuracy, working_precision=None, poles=(),
+                 nonneg_beta=False, contour_nu=None):
+    """Probe the largest usable |beta| on the + and - sides INDEPENDENTLY.
+
+    Run ONCE at the start of a search: M (the Dirichlet length) EXPLODES as beta nears the
+    admissibility bound, and does so at a DIFFERENT |beta| for +beta vs -beta when the
+    spectral parameters are asymmetric (e.g. at (33,15): +beta explodes by 1.2 while -beta
+    is still cheap at 1.356).  Clipping both sides to the worse one throws away the good
+    side's high-frequency weights, so probe each sign separately: reduce a side that
+    explodes, extend a side with headroom toward the bound.  `nonneg_beta` drops the -side
+    (beta>=0, for self-dual searches).  The spectral parameters barely move within a search,
+    so this need NOT be re-checked while probing/zooming.  Returns (bmax_plus, bmax_minus)
+    as magnitudes (>=0)."""
+    mu = landscape.mu_from_point(point)
+    nu = landscape.nu_from_point(point)
+    if contour_nu is None:
+        gd0 = lmfdb_to_rubinstein(mu, nu, landscape.conductor, 1)
+        contour_nu = _min_contour(FIXED_S, gd0.kappa, gd0.lam) + CONTOUR_MARGIN
+    M_LIMIT = max(300, 30 * int(round(accuracy)))
+    bound = admissibility_bound(landscape)
+    lo = bound - mpf("1.0")          # default clearance from the bound
+    hi = bound - mpf("0.5")          # never extend past here (integrand decays too slowly)
+    step = mpf("0.3")
+
+    def size(beta):
+        return _size_M(landscape, mu, nu, poles, beta, accuracy, working_precision,
+                       contour_nu, M_LIMIT)
+
+    def probe(sign):
+        b = lo
+        if size(sign * b) >= M_LIMIT:                     # exploded -> reduce
+            while b > mpf("0.4"):
+                b -= step
+                if size(sign * b) < M_LIMIT:
+                    break
+        else:                                             # headroom -> extend toward bound
+            while b + step <= hi and size(sign * (b + step)) < M_LIMIT:
+                b += step
+        return b
+
+    bmax_plus = probe(+1)
+    bmax_minus = mpf(0) if nonneg_beta else probe(-1)
+    return bmax_plus, bmax_minus
+
+
 def build_equation_system(landscape, euler, point, accuracy, working_precision=None,
                           poles=(), sign=None, n_detectors=8, lead_terms=5,
-                          weight_set=None, contour_nu=None):
+                          weight_set=None, contour_nu=None, beta_limits=None,
+                          nonneg_beta=False):
     """Precompute the residual system at `point` (the expensive Gamma/g work).
 
     If `weight_set` is given it is used as-is; otherwise a default set sized to the
     number of unknowns is generated.  `contour_nu` overrides the integration contour
     Re(z)=nu0 (default bound+1/2); moving it out shrinks the contour grid (faster
-    builds) with the aliasing error staying at target -- see exp_contour."""
+    builds) with the aliasing error staying at target -- see exp_contour.
+
+    `beta_limits`=(bmax_plus, bmax_minus): the +/- phase bounds, probed ONCE per search by
+    _beta_limits and threaded in (they barely move within a search).  If None they are
+    probed here (standalone use); `nonneg_beta` only affects that fallback probe."""
     mu = landscape.mu_from_point(point)
     nu = landscape.nu_from_point(point)
-    bmax = admissibility_bound(landscape) - mpf("1.0")   # keep beta well clear of the bound
-    #   (right at bound-0.8 the integrand converges very slowly: M jumps from ~27 to ~160)
 
     # default integration contour: out at bound + CONTOUR_MARGIN (faster grid, same
     # accuracy -- see CONTOUR_MARGIN).  At s=1/2 the f1/f2 bounds coincide.
@@ -248,12 +309,18 @@ def build_equation_system(landscape, euler, point, accuracy, working_precision=N
         gd0 = lmfdb_to_rubinstein(mu, nu, landscape.conductor, 1)
         contour_nu = _min_contour(FIXED_S, gd0.kappa, gd0.lam) + CONTOUR_MARGIN
 
-    # one auto-truncating call (most demanding weight) fixes the Dirichlet length M
-    Msz = coefficient_relation(FIXED_S, mu=mu, nu=nu, N=landscape.conductor, epsilon=1,
-                               poles=list(poles), g_m=0, g_alpha=0, g_beta=bmax,
-                               accuracy=accuracy, working_precision=working_precision,
-                               contour_nu=contour_nu)
-    M = Msz.num_terms
+    if beta_limits is None:
+        beta_limits = _beta_limits(landscape, point, accuracy, working_precision, poles,
+                                   nonneg_beta, contour_nu)
+    bmax_plus, bmax_minus = beta_limits
+
+    # M is fixed by the most-demanding weight -- the larger-|beta| side.  Size it per build
+    # (M grows with accuracy through the zoom) at the FIXED threaded limits; the limits were
+    # chosen so this side stays bounded, so this is one cheap call, not a re-probe.
+    M_LIMIT = max(300, 30 * int(round(accuracy)))
+    worst_beta = -bmax_minus if bmax_minus > bmax_plus else bmax_plus
+    M = _size_M(landscape, mu, nu, poles, worst_beta, accuracy, working_precision,
+                contour_nu, M_LIMIT)
 
     if weight_set is not None:
         wlist = list(weight_set.weights)
@@ -262,7 +329,8 @@ def build_equation_system(landscape, euler, point, accuracy, working_precision=N
         # can pick a well-conditioned subset (QR row selection) and reach more primes.
         need_eqs = count_unknowns(euler, M) + n_detectors
         nW = max(28, -(-need_eqs // 2) + 8)        # ceil(need/2) + selection headroom
-        wlist = list(default_weight_set(nW, beta_max=bmax).weights)
+        wlist = list(default_weight_set(nW, beta_max=bmax_plus,
+                                        beta_max_minus=bmax_minus).weights)
     weights = WeightSet(weights=wlist)
 
     # ONE shared Gamma grid for all weights (the big speed-up)
@@ -774,7 +842,7 @@ def _solve_corner(system, guess, eps_guess, deadline, restarts, fixed=None):
 
 def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
              guess=None, eps_guess=None, solver="square", deadline=None, verbose=False,
-             solve_restarts=0, angle=0):
+             solve_restarts=0, angle=0, beta_limits=None):
     """One box iteration's geometry: returns the corner solutions, the detector
     lines, and the candidate cloud (Step 4-6).
 
@@ -791,7 +859,8 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
 
     timed_out = lambda: deadline is not None and time.time() > deadline
 
-    sys0 = build_equation_system(landscape, euler, corners[0], accuracy, working_precision)
+    sys0 = build_equation_system(landscape, euler, corners[0], accuracy, working_precision,
+                                 beta_limits=beta_limits)
     sol0 = _solve_corner(sys0, guess, eps_guess, deadline, solve_restarts)
     if sol0 is None or timed_out():
         return None
@@ -807,7 +876,7 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
         if timed_out():             # bail between corners so a timeout doesn't overshoot
             return None
         sysc = build_equation_system(landscape, euler, c, accuracy, working_precision,
-                                     weight_set=weights)
+                                     weight_set=weights, beta_limits=beta_limits)
         solc = _solve_corner(sysc, sol0["ap"], sol0["epsilon"], deadline, solve_restarts,
                              fixed=fixed)
         if solc is None:            # a corner solve failed -> cannot form the geometry
@@ -1057,7 +1126,7 @@ def _coeff_distance(apA, apB, n_primes=DEDUP_PRIMES):
 def explore_candidates(landscape, euler, point, boxsize, accuracy, working_precision,
                        restarts=20, guess=None, eps_guess=None, k_min=3, k_max=None,
                        coeff_tol=mpf("0.4"), max_candidates=5, scale=mpf(3),
-                       deadline=None, verbose=True, trace=False):
+                       deadline=None, verbose=True, trace=False, beta_limits=None):
     """Find DISTINCT candidate solutions of the system near `point`.
 
     Varies the number of coefficients k (from k_min up to the available significant
@@ -1075,10 +1144,12 @@ def explore_candidates(landscape, euler, point, boxsize, accuracy, working_preci
         print(f"  building equation system at ({mpmath.nstr(point[0],10)}, "
               f"{mpmath.nstr(point[1],10)})  (accuracy {accuracy}, working precision "
               f"{working_precision}) ...")
-    sys0 = build_equation_system(landscape, euler, corners[0], accuracy, working_precision)
+    sys0 = build_equation_system(landscape, euler, corners[0], accuracy, working_precision,
+                                 beta_limits=beta_limits)
     weights = WeightSet(weights=sys0.weights)
     systems = [sys0] + [build_equation_system(landscape, euler, c, accuracy,
-                        working_precision, weight_set=weights) for c in corners[1:]]
+                        working_precision, weight_set=weights, beta_limits=beta_limits)
+                        for c in corners[1:]]
     cand_primes = sys0.primes
     if not cand_primes:
         return []
@@ -1180,7 +1251,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                      wander_dist=mpf("0.25"), timeout=600, refine_coeffs=True,
                      coeff_tol=mpf("0.4"), max_candidates=5, n_explore=12,
                      sharpen_iters=1, abandon_patience=6, explore_wp_cap=-1,
-                     scale=mpf(3), verbose=False, on_result=None):
+                     scale=mpf(3), nonneg_beta=False, verbose=False, on_result=None):
     """Explore near `point` for distinct candidate solutions (varying k and random
     Broyden restarts), then refine EACH distinct candidate into an L-point.  The time
     limit guards only the exploration; refinement of a real candidate runs to completion.
@@ -1206,12 +1277,24 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
         explore_wp = min(explore_wp, explore_wp_cap)
     deadline = (time.time() + timeout) if timeout else None
 
+    # Probe the +/- phase (beta) limits ONCE, here, and thread them through exploration and
+    # every refinement build: the spectral parameters barely move within a search, so there
+    # is no need to re-check during probing/zooming.  M explodes near the admissibility
+    # bound at a different |beta| for +beta vs -beta (asymmetric spectral parameters), so
+    # the two sides are bounded independently.  nonneg_beta -> beta>=0 (self-dual).
+    beta_limits = _beta_limits(landscape, point, explore_acc, explore_wp,
+                               nonneg_beta=nonneg_beta)
+    bmp, bmm = beta_limits
+    print(f"  beta limits: +{mpmath.nstr(bmp, 3)} / -{mpmath.nstr(bmm, 3)}"
+          + ("  (non-negative beta only)" if nonneg_beta else ""))
+
     # Full resume: the supplied coefficients already cover the significant primes -> just
     # refine from (point, guess); the box shrinks at once so the time limit is lifted and
     # the (possibly long) high-accuracy refinement runs to completion.
     if guess is not None:
         mp.dps = explore_wp
-        sys0 = build_equation_system(landscape, euler, point, explore_acc, explore_wp)
+        sys0 = build_equation_system(landscape, euler, point, explore_acc, explore_wp,
+                                     beta_limits=beta_limits)
         # full resume if the guess covers (all but at most one of) the significant primes
         if sys0.primes and len(set(sys0.primes) - set(guess)) <= 1:
             print("  resume: all significant primes supplied -> refining directly "
@@ -1223,7 +1306,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
             res = search(landscape, euler, point, boxsize, accuracy, working_precision,
                          target_box, guess=guess, eps_guess=eps_guess, max_iter=max_iter,
                          wander_dist=wander_dist, timeout=None, abandon_patience=0,
-                         explore_wp_cap=explore_wp_cap,
+                         explore_wp_cap=explore_wp_cap, beta_limits=beta_limits,
                          refine_coeffs=refine_coeffs, verbose=verbose)
             res["secs"] = time.time() - t0
             res["candidate"] = 0
@@ -1244,7 +1327,8 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
     cands = explore_candidates(landscape, euler, point, boxsize, explore_acc, explore_wp,
                                restarts=restarts, guess=guess, eps_guess=eps_guess,
                                coeff_tol=coeff_tol, max_candidates=n_explore, scale=scale,
-                               deadline=explore_deadline, verbose=True, trace=verbose)
+                               deadline=explore_deadline, verbose=True, trace=verbose,
+                               beta_limits=beta_limits)
 
     # (2) do ONE (sharpen_iters) refinement iteration on each candidate to sharpen its
     # centre and coefficients (the raw exploration coefficients are noisy), then
@@ -1259,7 +1343,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                    target_box, guess=cand["ap"], eps_guess=cand["epsilon"],
                    max_iter=sharpen_iters, wander_dist=wander_dist, timeout=refine_timeout,
                    abandon_patience=0, explore_wp_cap=explore_wp_cap,
-                   refine_coeffs=False, verbose=False)
+                   beta_limits=beta_limits, refine_coeffs=False, verbose=False)
         sol = r.get("sol")
         if sol is None or r.get("point") is None:
             continue
@@ -1299,7 +1383,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                      eps_guess=cand["epsilon"], max_iter=max_iter,
                      wander_dist=wander_dist, timeout=refine_timeout,
                      abandon_patience=abandon_patience, explore_wp_cap=explore_wp_cap,
-                     refine_coeffs=refine_coeffs, verbose=verbose)
+                     beta_limits=beta_limits, refine_coeffs=refine_coeffs, verbose=verbose)
         res["secs"] = time.time() - t0
         res["candidate"] = n
         results.append(res)
@@ -1308,7 +1392,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
     return results
 
 
-def _finalize_coeffs(result, landscape, euler, refine_coeffs, verbose):
+def _finalize_coeffs(result, landscape, euler, refine_coeffs, verbose, beta_limits=None):
     """At the converged point, recover the Euler coefficients by least-squares (more
     equations than unknowns), which is where the LSQ solve genuinely helps: it averages
     out per-equation noise and lets the high primes absorb their terms, sharpening the
@@ -1320,7 +1404,7 @@ def _finalize_coeffs(result, landscape, euler, refine_coeffs, verbose):
     wp = result["wp"]
     sol = result.get("sol") or {}
     mp.dps = wp
-    sysf = build_equation_system(landscape, euler, pt, acc, wp)
+    sysf = build_equation_system(landscape, euler, pt, acc, wp, beta_limits=beta_limits)
     ls = solve_at_point_lsq(sysf, guess=sol.get("ap"), eps_guess=sol.get("epsilon"))
     if ls is not None:
         result["sol"] = {"primes": ls["primes"], "ap": ls["ap"], "epsilon": ls["epsilon"]}
@@ -1335,7 +1419,8 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
            guess=None, eps_guess=None, max_iter=40, wander_dist=mpf("0.25"),
            stall_factor=mpf("0.9"), stall_patience=2, solver="square",
            refine_coeffs=True, timeout=600, solve_restarts=6, abandon_patience=6,
-           box_angle_step=mpf("2.39996"), explore_wp_cap=0, verbose=True):
+           box_angle_step=mpf("2.39996"), explore_wp_cap=0, beta_limits=None,
+           nonneg_beta=False, verbose=True):
     """Iterative search (Steps 1-8): move a triangular box toward an L-function, raising
     the accuracy (to tighten the spectral-parameter cloud) and the working precision (to
     keep the cloud points trustworthy) as the box shrinks.
@@ -1391,6 +1476,12 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
     last = None                  # last accepted (center, new_box, wp, cloud_prec, sol)
     deadline = (time.time() + timeout) if timeout else None
 
+    # probe the +/- phase (beta) limits ONCE (they barely move within a search) and thread
+    # them into every build; if the caller already probed (search_landscape), reuse those.
+    if beta_limits is None:
+        beta_limits = _beta_limits(landscape, point, int(round(accuracy)), wp,
+                                   nonneg_beta=nonneg_beta)
+
     def _timed_out():
         # the time limit only guards the search for an INITIAL solution; once the box has
         # shrunk (refining), a genuine candidate is being polished -- never abandon it
@@ -1433,7 +1524,8 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
             bs = box_step(landscape, euler, point, boxsize, int(round(accuracy)), wp,
                           guess=g, eps_guess=eg, solver=solver,
                           deadline=(None if refining else deadline), verbose=False,
-                          solve_restarts=solve_restarts, angle=box_angle_step * it)
+                          solve_restarts=solve_restarts, angle=box_angle_step * it,
+                          beta_limits=beta_limits)
             if _timed_out():
                 return {"status": "timeout", "reason": "time limit", "iter": it,
                         **(last or {"point": point})}
@@ -1561,7 +1653,7 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
 
         if new_box <= target and bracketed:
             return _finalize_coeffs({"status": "success", **last},
-                                    landscape, euler, refine_coeffs, verbose)
+                                    landscape, euler, refine_coeffs, verbose, beta_limits)
 
         if not bracketed and boxsize >= wander_dist:
             # grown to the wander limit without bracketing any L-function
@@ -1605,7 +1697,7 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
             if stalls >= stall_patience:
                 return _finalize_coeffs(
                     {"status": "converged", "reason": "detector floor", **last},
-                    landscape, euler, refine_coeffs, verbose)
+                    landscape, euler, refine_coeffs, verbose, beta_limits)
 
         prev_det = spread
         g, eg = sol["ap"], sol["epsilon"]
@@ -2043,6 +2135,16 @@ def _search_cli(argv):
                         "a_2,a_3,a_5,a_7,... (positional by prime) and/or 'p:val' tokens, "
                         "e.g. '-0.42-1.07j,-0.77+1.31j,-0.40-0.24j'.  When given, the "
                         "search warm-starts from them instead of cold random exploration.")
+    p.add_argument("--nonneg-beta", dest="nonneg_beta", default=None,
+                   action="store_true",
+                   help="restrict the weight phases to beta>=0 (drop the -beta side).  Valid "
+                        "for SELF-DUAL L-functions (the -beta weights are redundant there) and "
+                        "avoids probing/using a -beta side that may explode M near the "
+                        "admissibility bound.  Default: auto (on iff the landscape is "
+                        "self-dual).  --allow-neg-beta forces both sides on.")
+    p.add_argument("--allow-neg-beta", dest="nonneg_beta", action="store_false",
+                   help="force BOTH beta signs on even for a self-dual landscape "
+                        "(overrides the auto-on default of --nonneg-beta)")
     p.add_argument("--append", default=None, metavar="FILE",
                    help="append the result report(s) to this file (e.g. to log a grid)")
     p.add_argument("--verbose", action="store_true",
@@ -2064,6 +2166,9 @@ def _search_cli(argv):
     if land.dim != 2:
         p.error("the box-search geometry currently supports 2 spectral parameters only "
                 "(landscape %s has %d)" % (a.landscape, land.dim))
+    # non-negative beta: default AUTO -> on iff the landscape is self-dual (there the -beta
+    # weights are redundant), unless the user forced it on/off with the flags.
+    nonneg_beta = fam.self_dual if a.nonneg_beta is None else a.nonneg_beta
     mp.dps = a.working_precision
     eg = mpc(complex(a.epsilon.replace(" ", "")))
     # given coefficients are KEPT; the rest randomized (n_loc components per prime)
@@ -2089,7 +2194,7 @@ def _search_cli(argv):
         max_candidates=a.max_candidates, n_explore=a.explore_candidates,
         sharpen_iters=a.sharpen_iters, abandon_patience=a.abandon_after,
         explore_wp_cap=a.explore_wp, scale=mpf(a.coeff_scale),
-        verbose=a.verbose, on_result=on_result)
+        nonneg_beta=nonneg_beta, verbose=a.verbose, on_result=on_result)
     elapsed = time.time() - t0
 
     if not results:
