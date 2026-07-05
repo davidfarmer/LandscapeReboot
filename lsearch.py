@@ -1346,6 +1346,16 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                    beta_limits=beta_limits, refine_coeffs=False, verbose=False)
         sol = r.get("sol")
         if sol is None or r.get("point") is None:
+            # The one-iteration sharpen box_step failed to produce a cloud.  This does NOT
+            # mean the candidate is spurious: exploration finds candidates with DIRECT
+            # per-corner solves, whereas box_step uses the fragile triangle-corner
+            # continuation, which can fail at large |mu| even for a genuine det~floor
+            # detection.  Do not drop it -- fall back to the RAW exploration solution so the
+            # full refinement below still gets a chance (and a real L-point is not silently
+            # lost to a "no candidate found" report).
+            sharp.append({"center": cand["center"], "ap": cand["ap"],
+                          "epsilon": cand["epsilon"], "det": cand.get("det", mpf(1)),
+                          "box": boxsize, "result": None})
             continue
         if r.get("status") == "success":      # already converged in the sharpening step
             r["secs"] = 0.0
