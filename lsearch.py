@@ -1007,6 +1007,10 @@ BOX_DEADBAND = mpf("1.3")       # hold the box if the target is within this fact
 #   (dead-band + rate limits make the box TRACK the determination smoothly instead of
 #    flip-flopping between grow and zoom when the determination hovers near the box size)
 RECENTER_CAP = mpf(2)           # step toward the cloud at most this many box sizes / iter
+DET_BOX_RATIO = mpf("1e6")      # accept convergence when the determination is at least this
+#   many times finer than the box (and already <= target): the point is pinned far better
+#   than requested, so shrinking the box the last steps is pointless -- and at large |mu| it
+#   destabilizes the corner solve into a thrash that never closes.  See search().
 
 
 def _acc_max_for_target(target_box, ln10):
@@ -1669,8 +1673,25 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
             if verbose:
                 print("   (bracketed the L-point -> refining)")
 
-        if new_box <= target and bracketed:
-            return _finalize_coeffs({"status": "success", **last},
+        # Success on the box reaching the target, OR on the DETERMINATION already being far
+        # finer than both the target and the box: the box target only exists to pin the
+        # spectral point to ~target precision, so once the cloud spread is <= target and
+        # >= DET_BOX_RATIO times finer than the box, the point is determined better than
+        # requested and shrinking the box further is unnecessary.  This rescues large-|mu|
+        # refinements that reach ~1e-15 determination but cannot shrink the box the final
+        # steps (the free high primes destabilize the corner solve -> a grow/shrink thrash).
+        # Guarded by `refining` (bracketed, past the growth phase) so a small spread at a
+        # large, bias-prone box cannot trigger a premature success.
+        det_converged = (refining and spread <= target
+                         and new_box >= spread * DET_BOX_RATIO)
+        if bracketed and (new_box <= target or det_converged):
+            reason = {} if new_box <= target else {"reason": "determination below target"}
+            if verbose and new_box > target:
+                print(f"   (determination +-{mpmath.nstr(spread, 2)} is >= "
+                      f"{mpmath.nstr(DET_BOX_RATIO, 2)}x finer than box "
+                      f"{mpmath.nstr(new_box, 2)} and below target {mpmath.nstr(target, 2)} "
+                      f"-> converged)")
+            return _finalize_coeffs({"status": "success", **reason, **last},
                                     landscape, euler, refine_coeffs, verbose, beta_limits)
 
         if not bracketed and boxsize >= wander_dist:
