@@ -1664,7 +1664,7 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
                     "point": new_point, "box": new_box}
 
         last = {"point": new_point, "box": new_box, "iter": it,
-                "accuracy": int(round(accuracy)), "wp": wp,
+                "accuracy": int(round(accuracy)), "wp": wp, "determination": spread,
                 "cloud_prec": cloud_prec, "det_res": det_res, "sol": sol}
 
         # once the box brackets the point, refine in earnest (lift the exploration limit)
@@ -1685,7 +1685,8 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
         det_converged = (refining and spread <= target
                          and new_box >= spread * DET_BOX_RATIO)
         if bracketed and (new_box <= target or det_converged):
-            reason = {} if new_box <= target else {"reason": "determination below target"}
+            reason = {"reason": "box reached target"} if new_box <= target \
+                else {"reason": "determination below target"}
             if verbose and new_box > target:
                 print(f"   (determination +-{mpmath.nstr(spread, 2)} is >= "
                       f"{mpmath.nstr(DET_BOX_RATIO, 2)}x finer than box "
@@ -1981,9 +1982,13 @@ def _search_report(res, land, a, elapsed):
     status = res.get("status")
     reason = res.get("reason", "")
     box = res.get("box")
+    det = res.get("determination")
     pt = res.get("point")
-    # show the L-point to 3 digits beyond the determined accuracy (the box)
-    lam_dig = (digits(box) + 3) if (box and box > 0) else 16
+    # show the L-point to 3 digits beyond how well it is determined: the finer of the box
+    # and the (sub-box) determination -- e.g. a "determination below target" success is
+    # pinned far tighter than its (larger) box.
+    lam_prec = det if (det and box and det < box) else box
+    lam_dig = (digits(lam_prec) + 3) if (lam_prec and lam_prec > 0) else 16
 
     out = ["=" * 68]
     out.append("SEARCH RESULT   landscape: %s" % land.name)
@@ -1996,10 +2001,25 @@ def _search_report(res, land, a, elapsed):
         out.append("point found: l1 = %s ,  l2 = %s"
                    % (nstr(pt[0], lam_dig), nstr(pt[1], lam_dig)))
 
-    # ---- classify the outcome ------------------------------------------------
-    if status == "success":
+    # ---- classify the outcome: name the exact trigger that ended the search ------
+    # Every return path in search() sets (status, reason); map each to a distinct OUTCOME
+    # line so the report always says WHICH termination condition fired.
+    if status == "success" and reason == "determination below target":
         kind = "success"
-        out.append("OUTCOME: SUCCESS -- the box reached the target (%s)." % nstr(target, 2))
+        out.append("OUTCOME: SUCCESS (determination below target) -- the determination "
+                   "+-%s is finer than the target %s, so the point is pinned better than "
+                   "requested; the box held at %s and shrinking it further was unnecessary."
+                   % (nstr(det, 2) if det else nstr(box, 2), nstr(target, 2), nstr(box, 2)))
+    elif status == "success":                       # reason == "box reached target"
+        kind = "success"
+        out.append("OUTCOME: SUCCESS (box reached target) -- the box shrank to the "
+                   "target %s." % nstr(target, 2))
+    elif status == "converged":                     # reason == "detector floor"
+        kind = "converged"
+        out.append("OUTCOME: CONVERGED (detector floor) -- the determination stopped "
+                   "improving (hit the detector noise floor) at +-%s before the box "
+                   "reached the target %s; the box held at %s."
+                   % (nstr(det, 2) if det else nstr(box, 2), nstr(target, 2), nstr(box, 2)))
     elif status == "fail" and reason == "wandered":
         kind = "wandered"
         out.append("OUTCOME: FAILED (wandered) -- the centre drifted more than %s "
@@ -2009,13 +2029,19 @@ def _search_report(res, land, a, elapsed):
         out.append("OUTCOME: FAILED (no solution) -- could not solve at the start point.")
     elif status == "fail" and reason == "not converging":
         kind = "abandoned"
-        out.append("OUTCOME: ABANDONED -- the box went too many steps without shrinking "
-                   "(not converging to an L-function); raise --abandon-after to be more "
-                   "patient.")
+        out.append("OUTCOME: ABANDONED (box not shrinking) -- the box went too many steps "
+                   "without shrinking (not converging to an L-function); raise "
+                   "--abandon-after to be more patient.")
     elif status == "fail" and reason == "no point within range":
         kind = "norange"
         out.append("OUTCOME: FAILED (no point in range) -- the box grew to the wander "
                    "limit without bracketing any L-function.")
+    elif status == "fail" and reason == "max_iter":
+        kind = "maxiter"
+        out.append("OUTCOME: STOPPED (max iterations) -- reached the %d-iteration cap "
+                   "before the box reached the target %s (box at %s)."
+                   % (a.max_iter, nstr(target, 2),
+                      nstr(box, 2) if box is not None else "?"))
     elif status == "timeout":
         if box is not None and box < init_box * mpf("0.999"):
             kind = "partial"
@@ -2033,13 +2059,15 @@ def _search_report(res, land, a, elapsed):
                    % (nstr(init_box, 2), nstr(box, 2), nstr(target, 2)))
     else:
         kind = "noprogress"
-        out.append("OUTCOME: FAILED (box did not decrease) -- no L-function was "
-                   "resolved near the start point.")
+        out.append("OUTCOME: FAILED (%s) -- no L-function was resolved near the start "
+                   "point." % (reason or "box did not decrease"))
 
-    # ---- precision / accuracy + refine command (success or partial) ----------
-    if kind in ("success", "partial"):
+    # ---- precision / accuracy + refine command (any run that resolved a point) ----
+    if kind in ("success", "converged", "partial", "maxiter"):
+        # the point is pinned to the finer of the box and the (sub-box) determination
+        prec = det if (det and box and det < box) else box
         out.append("spectral parameters determined to +- %s  (about %d digits)."
-                   % (nstr(box, 2), digits(box)))
+                   % (nstr(prec, 2), digits(prec)))
         cp = res.get("cloud_prec")
         if cp is not None:
             out.append("numerical precision of the cloud points: %s." % nstr(cp, 2))
