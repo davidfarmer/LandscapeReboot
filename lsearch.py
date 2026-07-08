@@ -567,9 +567,79 @@ def _broyden(F, x0, h, tol, maxiter, deadline=None, stall_window=40):
     return best
 
 
+def _broyden_secant(F, x0, h, tol, maxiter, deadline=None, stall_window=40):
+    """Broyden's good method maintaining the INVERSE Jacobian H = B^{-1} via a rank-1
+    Sherman-Morrison update.  Mathematically the same secant iteration as _broyden, but
+    each step is dx = -H F plus a rank-1 update of H -- both O(n^2) (an outer product), with
+    NO per-iteration linear solve.  _broyden re-solves B dx = -F every step (O(n^3)), so at
+    the large prime counts of a big analytic conductor (n = 2 + 2k up to ~50) this is much
+    cheaper per iteration and is the default cold-search solver.  Returns (x, ||F||) of the
+    best iterate, or None if the initial Jacobian is singular.
+
+    Early exits: the stall_window / deadline of _broyden, PLUS guards specific to the inverse
+    form so a degenerate seed bails fast (instead of grinding to the stall limit -- which is
+    what made a naive inverse update slower than _broyden at the highest k): the step or the
+    residual blowing up, or the Sherman-Morrison denominator collapsing relative to its
+    scale -- all signal B going singular, the case where _broyden's lu_solve simply fails."""
+    n = len(x0)
+    x = [mpf(v) for v in x0]
+    Fx = F(x)
+    nrm = max(abs(v) for v in Fx)
+    best = (x[:], nrm)
+    if nrm < tol:
+        return best
+    blow = nrm * mpf("1e12") + mpf("1e6")                    # residual blow-up -> diverging
+    step_cap = mpf("1e8") + max(abs(v) for v in x) * mpf("1e6")   # step blow-up -> B singular
+    B = mpmath.matrix(n, n)                     # initial Jacobian, forward differences
+    for j in range(n):
+        if deadline is not None and time.time() > deadline:
+            return best
+        xp = x[:]
+        xp[j] = xp[j] + h
+        Fp = F(xp)
+        for i in range(n):
+            B[i, j] = (Fp[i] - Fx[i]) / h
+    try:
+        H = B ** -1                             # invert ONCE; then rank-1 inverse updates
+    except (ZeroDivisionError, ValueError):
+        return None                             # singular start -> give up (like _broyden)
+    Fxv = mpmath.matrix(Fx)
+    last_improve = 0
+    for it in range(maxiter):
+        if deadline is not None and time.time() > deadline:
+            return best
+        dx = -(H * Fxv)
+        if max(abs(dx[i]) for i in range(n)) > step_cap:     # inverse blew up -> singular
+            return best
+        x = [x[i] + dx[i] for i in range(n)]
+        Fn = F(x)
+        nrm = max(abs(v) for v in Fn)
+        if nrm < best[1]:
+            best = (x[:], nrm)
+            last_improve = it
+        if nrm < tol:
+            return (x[:], nrm)
+        if nrm > blow or it - last_improve > stall_window:
+            return best
+        Fnv = mpmath.matrix(Fn)
+        dF = Fnv - Fxv
+        HdF = H * dF
+        denom = mpmath.fsum(dx[i] * HdF[i] for i in range(n))     # dx^T H dF
+        ndx = mpmath.sqrt(mpmath.fsum(abs(dx[i]) ** 2 for i in range(n)))
+        nHdF = mpmath.sqrt(mpmath.fsum(abs(HdF[i]) ** 2 for i in range(n)))
+        if abs(denom) <= ndx * nHdF * mpf("1e-14"):          # update ill-conditioned -> bail
+            return best
+        # H += (dx - H dF)(dx^T H) / denom  -- rank-1 outer product via mpmath (O(n^2))
+        num = dx - HdF                          # column (n x 1)
+        rowvec = dx.T * H                        # row (1 x n): dx^T H
+        H = H + (num * rowvec) / denom
+        Fxv = Fnv
+    return best
+
+
 def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
                    tol=None, det_tol=None, maxiter=150, n_detectors=8,
-                   fixed=None, deadline=None, verbose=False):
+                   fixed=None, deadline=None, verbose=False, root_finder=None):
     """Find a solution at system.point, restricting the unknown primes and enlarging
     the set if no solution is found.
 
@@ -591,6 +661,7 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
         det_tol = mpf(10) ** (-(system.accuracy - 1))
     cond_cap = mpf(10) ** (system.working_precision / 2)   # don't lose > half the digits
     h = mpf(10) ** (-(system.working_precision // 3))
+    root_finder = root_finder or _broyden_secant           # default: the O(n^2) secant
 
     K = len(system.A)
     nloc = system.euler.complex_unknowns_per_prime
@@ -621,7 +692,7 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
             full = residual(system, u, primes=_pr)
             return [full[i] for i in _si]
 
-        out = _broyden(F, x0, h, tol, maxiter, deadline=deadline)
+        out = root_finder(F, x0, h, tol, maxiter, deadline=deadline)
         if out is None:             # Jacobian went singular at this prime count
             if verbose:
                 print(f"   k={k} primes={primes}: Broyden singular")
@@ -817,7 +888,7 @@ def _cloud_from_corners(systems, sols, point, h, detector_idx, working_precision
     return cloud, cloud_info, lines
 
 
-def _solve_corner(system, guess, eps_guess, deadline, restarts, fixed=None):
+def _solve_corner(system, guess, eps_guess, deadline, restarts, fixed=None, root_finder=None):
     """Solve at system.point, trying the warm `guess` (the previous iteration's solution)
     first; if it fails, try up to `restarts` NEARBY starting points -- small perturbations
     of the warm guess, and keep-the-low-primes / randomize-the-rest restarts -- so a single
@@ -826,8 +897,9 @@ def _solve_corner(system, guess, eps_guess, deadline, restarts, fixed=None):
     def solve(seed):
         if fixed is not None:
             return solve_at_point(system, guess=seed, eps_guess=eps_guess,
-                                  fixed=fixed, deadline=deadline)
-        return solve_at_point(system, guess=seed, eps_guess=eps_guess, deadline=deadline)
+                                  fixed=fixed, deadline=deadline, root_finder=root_finder)
+        return solve_at_point(system, guess=seed, eps_guess=eps_guess, deadline=deadline,
+                              root_finder=root_finder)
 
     sol = solve(guess)
     if sol is not None or restarts <= 0:
@@ -850,7 +922,7 @@ def _solve_corner(system, guess, eps_guess, deadline, restarts, fixed=None):
 
 def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
              guess=None, eps_guess=None, solver="square", deadline=None, verbose=False,
-             solve_restarts=0, angle=0, beta_limits=None):
+             solve_restarts=0, angle=0, beta_limits=None, root_finder=None):
     """One box iteration's geometry: returns the corner solutions, the detector
     lines, and the candidate cloud (Step 4-6).
 
@@ -869,7 +941,8 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
 
     sys0 = build_equation_system(landscape, euler, corners[0], accuracy, working_precision,
                                  beta_limits=beta_limits)
-    sol0 = _solve_corner(sys0, guess, eps_guess, deadline, solve_restarts)
+    sol0 = _solve_corner(sys0, guess, eps_guess, deadline, solve_restarts,
+                         root_finder=root_finder)
     if sol0 is None or timed_out():
         return None
     k = sol0["k"]
@@ -886,7 +959,7 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
         sysc = build_equation_system(landscape, euler, c, accuracy, working_precision,
                                      weight_set=weights, beta_limits=beta_limits)
         solc = _solve_corner(sysc, sol0["ap"], sol0["epsilon"], deadline, solve_restarts,
-                             fixed=fixed)
+                             fixed=fixed, root_finder=root_finder)
         if solc is None:            # a corner solve failed -> cannot form the geometry
             return None
         systems.append(sysc)
@@ -1138,7 +1211,8 @@ def _coeff_distance(apA, apB, n_primes=DEDUP_PRIMES):
 def explore_candidates(landscape, euler, point, boxsize, accuracy, working_precision,
                        restarts=20, guess=None, eps_guess=None, k_min=3, k_max=None,
                        coeff_tol=mpf("0.4"), max_candidates=5, scale=mpf(3),
-                       deadline=None, verbose=True, trace=False, beta_limits=None):
+                       deadline=None, verbose=True, trace=False, beta_limits=None,
+                       root_finder=None):
     """Find DISTINCT candidate solutions of the system near `point`.
 
     Varies the number of coefficients k (from k_min up to the available significant
@@ -1197,7 +1271,7 @@ def explore_candidates(landscape, euler, point, boxsize, accuracy, working_preci
             if deadline is not None and time.time() > deadline:
                 break
             s = solve_at_point(sys0, guess=seed, eps_guess=eps_guess,
-                               k_init=k, k_max=k, deadline=deadline)
+                               k_init=k, k_max=k, deadline=deadline, root_finder=root_finder)
             if s is not None:
                 sols0.append(s)
         if trace:                          # per-k progress so the wait is not silent
@@ -1228,7 +1302,7 @@ def explore_candidates(landscape, euler, point, boxsize, accuracy, working_preci
         sols, ok = [s], True
         for i in (1, 2):
             sc = solve_at_point(systems[i], guess=s["ap"], eps_guess=s["epsilon"],
-                                fixed=fixed)
+                                fixed=fixed, root_finder=root_finder)
             if sc is None:
                 ok = False
                 break
@@ -1263,7 +1337,8 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                      wander_dist=mpf("0.25"), timeout=600, refine_coeffs=True,
                      coeff_tol=mpf("0.4"), max_candidates=5, n_explore=12,
                      sharpen_iters=1, abandon_patience=6, explore_wp_cap=-1,
-                     scale=mpf(3), nonneg_beta=False, verbose=False, on_result=None):
+                     scale=mpf(3), nonneg_beta=False, root_finder=None,
+                     verbose=False, on_result=None):
     """Explore near `point` for distinct candidate solutions (varying k and random
     Broyden restarts), then refine EACH distinct candidate into an L-point.  The time
     limit guards only the exploration; refinement of a real candidate runs to completion.
@@ -1319,6 +1394,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                          target_box, guess=guess, eps_guess=eps_guess, max_iter=max_iter,
                          wander_dist=wander_dist, timeout=None, abandon_patience=0,
                          explore_wp_cap=explore_wp_cap, beta_limits=beta_limits,
+                         root_finder=root_finder,
                          refine_coeffs=refine_coeffs, verbose=verbose)
             res["secs"] = time.time() - t0
             res["candidate"] = 0
@@ -1340,7 +1416,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                                restarts=restarts, guess=guess, eps_guess=eps_guess,
                                coeff_tol=coeff_tol, max_candidates=n_explore, scale=scale,
                                deadline=explore_deadline, verbose=True, trace=verbose,
-                               beta_limits=beta_limits)
+                               beta_limits=beta_limits, root_finder=root_finder)
 
     # (2) do ONE (sharpen_iters) refinement iteration on each candidate to sharpen its
     # centre and coefficients (the raw exploration coefficients are noisy), then
@@ -1355,7 +1431,8 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                    target_box, guess=cand["ap"], eps_guess=cand["epsilon"],
                    max_iter=sharpen_iters, wander_dist=wander_dist, timeout=refine_timeout,
                    abandon_patience=0, explore_wp_cap=explore_wp_cap,
-                   beta_limits=beta_limits, refine_coeffs=False, verbose=False)
+                   beta_limits=beta_limits, root_finder=root_finder,
+                   refine_coeffs=False, verbose=False)
         sol = r.get("sol")
         if sol is None or r.get("point") is None:
             # The one-iteration sharpen box_step failed to produce a cloud.  This does NOT
@@ -1405,7 +1482,8 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                      eps_guess=cand["epsilon"], max_iter=max_iter,
                      wander_dist=wander_dist, timeout=refine_timeout,
                      abandon_patience=abandon_patience, explore_wp_cap=explore_wp_cap,
-                     beta_limits=beta_limits, refine_coeffs=refine_coeffs, verbose=verbose)
+                     beta_limits=beta_limits, root_finder=root_finder,
+                     refine_coeffs=refine_coeffs, verbose=verbose)
         res["secs"] = time.time() - t0
         res["candidate"] = n
         results.append(res)
@@ -1442,7 +1520,7 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
            stall_factor=mpf("0.9"), stall_patience=2, solver="square",
            refine_coeffs=True, timeout=600, solve_restarts=6, abandon_patience=6,
            box_angle_step=mpf("2.39996"), explore_wp_cap=0, beta_limits=None,
-           nonneg_beta=False, verbose=True):
+           nonneg_beta=False, root_finder=None, verbose=True):
     """Iterative search (Steps 1-8): move a triangular box toward an L-function, raising
     the accuracy (to tighten the spectral-parameter cloud) and the working precision (to
     keep the cloud points trustworthy) as the box shrinks.
@@ -1547,7 +1625,7 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
                           guess=g, eps_guess=eg, solver=solver,
                           deadline=(None if refining else deadline), verbose=False,
                           solve_restarts=solve_restarts, angle=box_angle_step * it,
-                          beta_limits=beta_limits)
+                          beta_limits=beta_limits, root_finder=root_finder)
             if _timed_out():
                 return {"status": "timeout", "reason": "time limit", "iter": it,
                         **(last or {"point": point})}
@@ -2212,6 +2290,12 @@ def _search_cli(argv):
     p.add_argument("--allow-neg-beta", dest="nonneg_beta", action="store_false",
                    help="force BOTH beta signs on even for a self-dual landscape "
                         "(overrides the auto-on default of --nonneg-beta)")
+    p.add_argument("--cold-solver", default="secant", choices=("secant", "broyden"),
+                   help="root-finder for the corner solves.  'secant' (default) is Broyden's "
+                        "method maintaining the inverse Jacobian (Sherman-Morrison), O(n^2) "
+                        "per step -- much faster at the large prime counts of a big analytic "
+                        "conductor.  'broyden' is the classic form that re-solves B dx=-F "
+                        "each step (O(n^3)).  Both take the same secant steps.")
     p.add_argument("--append", default=None, metavar="FILE",
                    help="append the result report(s) to this file (e.g. to log a grid)")
     p.add_argument("--verbose", action="store_true",
@@ -2236,6 +2320,7 @@ def _search_cli(argv):
     # non-negative beta: default AUTO -> on iff the landscape is self-dual (there the -beta
     # weights are redundant), unless the user forced it on/off with the flags.
     nonneg_beta = fam.self_dual if a.nonneg_beta is None else a.nonneg_beta
+    root_finder = _broyden if a.cold_solver == "broyden" else _broyden_secant
     mp.dps = a.working_precision
     eg = mpc(complex(a.epsilon.replace(" ", "")))
     # given coefficients are KEPT; the rest randomized (n_loc components per prime)
@@ -2261,7 +2346,8 @@ def _search_cli(argv):
         max_candidates=a.max_candidates, n_explore=a.explore_candidates,
         sharpen_iters=a.sharpen_iters, abandon_patience=a.abandon_after,
         explore_wp_cap=a.explore_wp, scale=mpf(a.coeff_scale),
-        nonneg_beta=nonneg_beta, verbose=a.verbose, on_result=on_result)
+        nonneg_beta=nonneg_beta, root_finder=root_finder,
+        verbose=a.verbose, on_result=on_result)
     elapsed = time.time() - t0
 
     if not results:
