@@ -803,16 +803,28 @@ def _lsq_core(system, primes, fit_idx, x0, tol, maxiter, damping=mpf("1e-30")):
         for i in range(len(fit_idx)):
             J[i][j] = (rp[i] - rm[i]) / (2 * h)
     Jm = mpmath.matrix(J)
+    # The Jacobian is FIXED across the (chord) Gauss-Newton steps, so factor it ONCE and
+    # reuse the factorization -- qr_solve re-factors the same matrix on every step.  Skinny
+    # QR gives Jm = Q R (Q is m x n, R is n x n upper-triangular); the least-squares step is
+    # du = R^{-1} Q^T (-Fx), a matvec plus a small n x n triangular solve, instead of a full
+    # m x n QR each step.  Same solution as qr_solve (QR is the same factorization).
+    try:
+        QR = mpmath.qr(Jm, mode="skinny")
+    except Exception:                           # QR unavailable/failed -> per-step fallback
+        QR = None
 
     def step(Fx):
         Fv = mpmath.matrix(Fx)
-        try:                                    # least-squares step via QR
-            return mpmath.qr_solve(Jm, -Fv)[0]
-        except Exception:                       # rank-deficient -> damped normal eqs
-            JtJ = Jm.T * Jm
-            for i in range(U):
-                JtJ[i, i] += damping
-            return mpmath.lu_solve(JtJ, -(Jm.T * Fv))
+        if QR is not None:
+            Q, R = QR
+            try:
+                return mpmath.lu_solve(R, Q.T * (-Fv))
+            except Exception:
+                pass                            # R singular (rank-deficient) -> normal eqs
+        JtJ = Jm.T * Jm                         # LM-damped normal equations fallback
+        for i in range(U):
+            JtJ[i, i] += damping
+        return mpmath.lu_solve(JtJ, -(Jm.T * Fv))
 
     nrm = None
     for _ in range(maxiter):
