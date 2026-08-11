@@ -191,6 +191,48 @@ def read_weight_file(path):
     return WeightSet(weights=weights)
 
 
+def _fmt_weight_num(z):
+    """Format a weight's alpha/beta for a weight file: a plain real, or 're+imj'."""
+    z = mpc(z)
+    re, im = mpmath.re(z), mpmath.im(z)
+    if im == 0:
+        return mpmath.nstr(re, 15)
+    return f"{mpmath.nstr(re, 15)}{'+' if im >= 0 else '-'}{mpmath.nstr(abs(im), 15)}j"
+
+
+def used_weight_order(system, sol):
+    """The indices of the weights ACTUALLY USED by a solve, in order: first the weights of
+    the square solve equations (sol['solve_idx'], skipping the sign-normalization row), then
+    the detector weights (sol['det_idx']), de-duplicated first-seen; any weights not used are
+    appended so the full pool is preserved.  Each weight i owns residual rows 2i (Re) and
+    2i+1 (Im), so row r belongs to weight r//2.  With QR selection this is the order QR
+    picked; with strict-sequential it is just the file order."""
+    K = len(system.weights)
+    order, seen = [], set()
+    for r in list(sol.get("solve_idx", [])) + list(sol.get("det_idx", [])):
+        if r >= 2 * K:                      # the sign-normalization row has no weight
+            continue
+        wi = r // 2
+        if wi not in seen:
+            seen.add(wi)
+            order.append(wi)
+    for wi in range(K):                     # keep the unused weights (the rest of the pool)
+        if wi not in seen:
+            order.append(wi)
+    return order
+
+
+def write_weight_file(path, weights, header_lines=()):
+    """Write a list of (m, alpha, beta) weights to `path` in read_weight_file format
+    (one 'm, alpha, beta' per line), with optional '#'-comment header_lines.  Round-trips
+    through read_weight_file."""
+    lines = list(header_lines)
+    for (m, al, be) in weights:
+        lines.append(f"{int(m)}, {_fmt_weight_num(al)}, {_fmt_weight_num(be)}")
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
 # ---------------------------------------------------------------------------
 # Sizing: number of Dirichlet terms and number of unknowns
 # ---------------------------------------------------------------------------
@@ -255,6 +297,7 @@ class EquationSystem:
     sign: Optional[mpc] = None   # if not None, pin epsilon to this value
     in_order: bool = False       # weights are a file POOL -> take the first (needed) ones
     #                              in file order (vs. reuse/generate); see build_equation_system
+    strict_seq: bool = False     # solve uses the equations strictly IN ORDER (no QR pivot)
 
 
 def pack_unknowns(epsilon, ap, primes):
@@ -338,7 +381,7 @@ def _beta_limits(landscape, point, accuracy, working_precision=None, poles=(),
 def build_equation_system(landscape, euler, point, accuracy, working_precision=None,
                           poles=(), sign=None, n_detectors=8, lead_terms=5,
                           weight_set=None, contour_nu=None, beta_limits=None,
-                          nonneg_beta=False, in_order=False):
+                          nonneg_beta=False, in_order=False, strict_seq=False):
     """Precompute the residual system at `point` (the expensive Gamma/g work).
 
     If `weight_set` is given it is used in its listed order; otherwise a default diverse
@@ -346,9 +389,10 @@ def build_equation_system(landscape, euler, point, accuracy, working_precision=N
     weights are a file POOL) takes the first (needed) weights from the FRONT of that pool,
     in order (the probe still decides how many); with `in_order=False` a supplied
     `weight_set` is used as-is (e.g. the same weights reused at every box corner).
-    Either way the square solve then QR-selects a well-conditioned subset.  `contour_nu`
-    overrides the integration contour Re(z)=nu0 (default bound+1/2); moving it out shrinks
-    the contour grid (faster builds) with the aliasing error staying at target.
+    `strict_seq=True` records that the solve should use the equations strictly in order (no
+    QR pivot -- see solve_at_point); otherwise the square solve QR-selects a well-conditioned
+    subset.  `contour_nu` overrides the integration contour Re(z)=nu0 (default bound+1/2);
+    moving it out shrinks the contour grid (faster builds) with the aliasing error at target.
 
     `beta_limits`=(bmax_plus, bmax_minus): the +/- phase bounds, probed ONCE per search by
     _beta_limits and threaded in (they barely move within a search).  If None they are
@@ -442,7 +486,7 @@ def build_equation_system(landscape, euler, point, accuracy, working_precision=N
                           M=M, primes=primes, n_unknowns=U, A=A, B=B, pole=pole,
                           scales=scales, weights=weights.weights,
                           solve_idx=solve_idx, detector_idx=detector_idx, sign=sign,
-                          in_order=in_order)
+                          in_order=in_order, strict_seq=strict_seq)
 
 
 def residual(system, u, primes=None):
@@ -552,6 +596,25 @@ def _select_from_jacobian(jac_full, K, euler, k, n_detectors):
     sel = _select_rows(sub, (U - 1) + n_detectors)
     solve_idx = sel[:U - 1] + [2 * K]                      # + the sign normalization
     det_idx = sel[U - 1:U - 1 + n_detectors]
+    return solve_idx, det_idx
+
+
+def _sequential_select(K, euler, k, n_detectors):
+    """STRICT-sequential equation selection: take the residual rows IN ORDER, no QR pivoting.
+    The square solve set is the first U-1 rows (Re/Im of the leading weights, in weight
+    order) plus the sign normalization (row 2K); the detectors are the next n_detectors
+    rows.  Returns (solve_idx, det_idx), or None if there are too few equations for k
+    unknowns.  Far more sensitive to the weight ORDER than _select_from_jacobian -- an
+    ill-conditioned leading block will not resolve the coefficients -- so it is opt-in
+    (--strict-sequential) and expects a deliberately ordered weight file."""
+    rpp = euler.real_unknowns_per_prime
+    U = 2 + rpp * k
+    if 2 * K < (U - 1) + n_detectors:       # not enough equations for solve set + detectors
+        if 2 * K < U - 1:                   # not even enough for the square solve -> stop
+            return None
+        n_detectors = max(0, 2 * K - (U - 1))
+    solve_idx = list(range(U - 1)) + [2 * K]                 # first U-1 rows + normalization
+    det_idx = list(range(U - 1, U - 1 + n_detectors))
     return solve_idx, det_idx
 
 
@@ -744,10 +807,14 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
             k_max = len(cand)
         k_init = max(1, min(k_init, len(cand)))
         ks = list(range(k_init, k_max + 1))
-        # one equation Jacobian over ALL candidate primes; per-k selection reuses its
-        # columns (far cheaper than re-differencing for every prime count)
-        xall = _guess_vector(cand, guess, eps_guess, nloc)
-        jac_full = _equation_jacobian(system, xall, cand, 2 * K, deadline=deadline)
+        strict = getattr(system, "strict_seq", False)
+        if strict:
+            jac_full = None             # strict-sequential selection needs no equation Jacobian
+        else:
+            # one equation Jacobian over ALL candidate primes; per-k selection reuses its
+            # columns (far cheaper than re-differencing for every prime count)
+            xall = _guess_vector(cand, guess, eps_guess, nloc)
+            jac_full = _equation_jacobian(system, xall, cand, 2 * K, deadline=deadline)
 
     best = None
     for k in ks:
@@ -755,8 +822,14 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
             break                       # out of time -> return the best found so far
         if fixed is None:
             primes = cand[:k]
-            solve_idx, det_idx = _select_from_jacobian(jac_full, K, system.euler,
-                                                       k, n_detectors)
+            if getattr(system, "strict_seq", False):    # use the equations strictly in order
+                sel = _sequential_select(K, system.euler, k, n_detectors)
+                if sel is None:         # too few weights for this many unknowns -> stop
+                    break
+                solve_idx, det_idx = sel
+            else:
+                solve_idx, det_idx = _select_from_jacobian(jac_full, K, system.euler,
+                                                           k, n_detectors)
         x0 = _guess_vector(primes, guess, eps_guess, nloc)
 
         def F(u, _si=solve_idx, _pr=primes):
@@ -1006,7 +1079,7 @@ def _solve_corner(system, guess, eps_guess, deadline, restarts, fixed=None, root
 def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
              guess=None, eps_guess=None, solver="square", deadline=None, verbose=False,
              solve_restarts=0, angle=0, beta_limits=None, root_finder=None,
-             weight_set=None, in_order=False):
+             weight_set=None, in_order=False, strict_seq=False):
     """One box iteration's geometry: returns the corner solutions, the detector
     lines, and the candidate cloud (Step 4-6).
 
@@ -1025,7 +1098,7 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
 
     sys0 = build_equation_system(landscape, euler, corners[0], accuracy, working_precision,
                                  beta_limits=beta_limits, weight_set=weight_set,
-                                 in_order=in_order)
+                                 in_order=in_order, strict_seq=strict_seq)
     sol0 = _solve_corner(sys0, guess, eps_guess, deadline, solve_restarts,
                          root_finder=root_finder)
     if sol0 is None or timed_out():
@@ -1043,7 +1116,7 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
             return None
         sysc = build_equation_system(landscape, euler, c, accuracy, working_precision,
                                      weight_set=weights, beta_limits=beta_limits,
-                                     in_order=in_order)
+                                     in_order=in_order, strict_seq=strict_seq)
         solc = _solve_corner(sysc, sol0["ap"], sol0["epsilon"], deadline, solve_restarts,
                              fixed=fixed, root_finder=root_finder)
         if solc is None:            # a corner solve failed -> cannot form the geometry
@@ -1298,7 +1371,7 @@ def explore_candidates(landscape, euler, point, boxsize, accuracy, working_preci
                        restarts=20, guess=None, eps_guess=None, k_min=3, k_max=None,
                        coeff_tol=mpf("0.4"), max_candidates=5, scale=mpf(3),
                        deadline=None, verbose=True, trace=False, beta_limits=None,
-                       root_finder=None, weight_set=None, in_order=False):
+                       root_finder=None, weight_set=None, in_order=False, strict_seq=False):
     """Find DISTINCT candidate solutions of the system near `point`.
 
     Varies the number of coefficients k (from k_min up to the available significant
@@ -1318,11 +1391,11 @@ def explore_candidates(landscape, euler, point, boxsize, accuracy, working_preci
               f"{working_precision}) ...")
     sys0 = build_equation_system(landscape, euler, corners[0], accuracy, working_precision,
                                  beta_limits=beta_limits, weight_set=weight_set,
-                                 in_order=in_order)
+                                 in_order=in_order, strict_seq=strict_seq)
     weights = WeightSet(weights=sys0.weights)
     systems = [sys0] + [build_equation_system(landscape, euler, c, accuracy,
                         working_precision, weight_set=weights, beta_limits=beta_limits,
-                        in_order=in_order)
+                        in_order=in_order, strict_seq=strict_seq)
                         for c in corners[1:]]
     cand_primes = sys0.primes
     if not cand_primes:
@@ -1426,7 +1499,8 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                      coeff_tol=mpf("0.4"), max_candidates=5, n_explore=12,
                      sharpen_iters=1, abandon_patience=6, explore_wp_cap=-1,
                      scale=mpf(3), nonneg_beta=False, root_finder=None,
-                     weight_set=None, in_order=False, verbose=False, on_result=None):
+                     weight_set=None, in_order=False, strict_seq=False,
+                     verbose=False, on_result=None):
     """Explore near `point` for distinct candidate solutions (varying k and random
     Broyden restarts), then refine EACH distinct candidate into an L-point.  The time
     limit guards only the exploration; refinement of a real candidate runs to completion.
@@ -1470,7 +1544,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
         mp.dps = explore_wp
         sys0 = build_equation_system(landscape, euler, point, explore_acc, explore_wp,
                                      beta_limits=beta_limits, weight_set=weight_set,
-                                     in_order=in_order)
+                                     in_order=in_order, strict_seq=strict_seq)
         # full resume if the guess covers (all but at most one of) the significant primes
         if sys0.primes and len(set(sys0.primes) - set(guess)) <= 1:
             print("  resume: all significant primes supplied -> refining directly "
@@ -1484,7 +1558,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                          wander_dist=wander_dist, timeout=None, abandon_patience=0,
                          explore_wp_cap=explore_wp_cap, beta_limits=beta_limits,
                          root_finder=root_finder, weight_set=weight_set, in_order=in_order,
-                         refine_coeffs=refine_coeffs, verbose=verbose)
+                         strict_seq=strict_seq, refine_coeffs=refine_coeffs, verbose=verbose)
             res["secs"] = time.time() - t0
             res["candidate"] = 0
             if on_result is not None:
@@ -1506,7 +1580,8 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                                coeff_tol=coeff_tol, max_candidates=n_explore, scale=scale,
                                deadline=explore_deadline, verbose=True, trace=verbose,
                                beta_limits=beta_limits, root_finder=root_finder,
-                               weight_set=weight_set, in_order=in_order)
+                               weight_set=weight_set, in_order=in_order,
+                               strict_seq=strict_seq)
 
     # (2) do ONE (sharpen_iters) refinement iteration on each candidate to sharpen its
     # centre and coefficients (the raw exploration coefficients are noisy), then
@@ -1522,7 +1597,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                    max_iter=sharpen_iters, wander_dist=wander_dist, timeout=refine_timeout,
                    abandon_patience=0, explore_wp_cap=explore_wp_cap,
                    beta_limits=beta_limits, root_finder=root_finder,
-                   weight_set=weight_set, in_order=in_order,
+                   weight_set=weight_set, in_order=in_order, strict_seq=strict_seq,
                    refine_coeffs=False, verbose=False)
         sol = r.get("sol")
         if sol is None or r.get("point") is None:
@@ -1574,7 +1649,7 @@ def search_landscape(landscape, euler, point, boxsize, accuracy, working_precisi
                      wander_dist=wander_dist, timeout=refine_timeout,
                      abandon_patience=abandon_patience, explore_wp_cap=explore_wp_cap,
                      beta_limits=beta_limits, root_finder=root_finder,
-                     weight_set=weight_set, in_order=in_order,
+                     weight_set=weight_set, in_order=in_order, strict_seq=strict_seq,
                      refine_coeffs=refine_coeffs, verbose=verbose)
         res["secs"] = time.time() - t0
         res["candidate"] = n
@@ -1613,7 +1688,7 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
            refine_coeffs=True, timeout=600, solve_restarts=6, abandon_patience=6,
            box_angle_step=mpf("2.39996"), explore_wp_cap=0, beta_limits=None,
            nonneg_beta=False, root_finder=None, weight_set=None, in_order=False,
-           verbose=True):
+           strict_seq=False, verbose=True):
     """Iterative search (Steps 1-8): move a triangular box toward an L-function, raising
     the accuracy (to tighten the spectral-parameter cloud) and the working precision (to
     keep the cloud points trustworthy) as the box shrinks.
@@ -1719,7 +1794,7 @@ def search(landscape, euler, point, boxsize, accuracy, working_precision, target
                           deadline=(None if refining else deadline), verbose=False,
                           solve_restarts=solve_restarts, angle=box_angle_step * it,
                           beta_limits=beta_limits, root_finder=root_finder,
-                          weight_set=weight_set, in_order=in_order)
+                          weight_set=weight_set, in_order=in_order, strict_seq=strict_seq)
             if _timed_out():
                 return {"status": "timeout", "reason": "time limit", "iter": it,
                         **(last or {"point": point})}
@@ -2309,6 +2384,48 @@ def _parse_coeffs(text, n_loc=1):
     return out
 
 
+def _save_used_equations(land, euler, point, a, weight_set, strict_seq, nonneg_beta,
+                         root_finder):
+    """Build one representative system at the start point, run one solve over all the
+    determinable primes to see which equations (weights) it uses and in what order, and
+    write those weights -- in used order -- to a.save_equations (round-trippable via
+    --weights-file).  Captures the QR-selected order when not strict."""
+    import time as _time
+    print("  --save-equations: building a representative system at (%s, %s) to capture "
+          "the used weight order ..." % (mpmath.nstr(point[0], 8), mpmath.nstr(point[1], 8)))
+    mp.dps = a.working_precision
+    t = _time.time()
+    sysr = build_equation_system(land, euler, point, a.accuracy, a.working_precision,
+                                 weight_set=weight_set, in_order=(weight_set is not None),
+                                 strict_seq=strict_seq, nonneg_beta=nonneg_beta)
+    sol = solve_at_point(sysr, root_finder=root_finder)
+    if sol is None:
+        # no solve converged (e.g. off-form point): fall back to the built order, marking
+        # the whole pool as "order used = build order" so the file is still complete.
+        order = list(range(len(sysr.weights)))
+        note = "no solve converged at the start point; weights in BUILD order"
+    else:
+        order = used_weight_order(sysr, sol)
+        note = ("STRICT-SEQUENTIAL order (= file/build order)" if strict_seq
+                else "QR-SELECTED order at k=%d (solve equations first, then detectors, "
+                     "then unused)" % sol["k"])
+    weights_ordered = [sysr.weights[i] for i in order]
+    header = [
+        "# Weight functions in the ORDER ACTUALLY USED by the solve.",
+        "# landscape %s, point (%s, %s), accuracy %d, working precision %d."
+        % (land.name, mpmath.nstr(point[0], 12), mpmath.nstr(point[1], 12),
+           a.accuracy, a.working_precision),
+        "# %s." % note,
+        "# %d weights (M=%d, %d determinable primes).  Reuse with --weights-file;"
+        % (len(weights_ordered), sysr.M, len(sysr.primes)),
+        "# add --strict-sequential to replay this exact order without QR reselection.",
+        "#  m ,        alpha        ,        beta",
+    ]
+    write_weight_file(a.save_equations, weights_ordered, header)
+    print("  --save-equations: wrote %d weights in used order to %s  (%s, %.0fs)"
+          % (len(weights_ordered), a.save_equations, note, _time.time() - t))
+
+
 def _search_cli(argv):
     """Command-line search of a landscape (loaded from the registry landscapes.txt by
     name, or from an ad-hoc file), for an L-function near a starting spectral point.
@@ -2398,6 +2515,21 @@ def _search_cli(argv):
                         "it needs, then takes that many from the FRONT of the file, in the "
                         "listed order (the square solve QR-selects a well-conditioned subset "
                         "of those, so put a diverse mix of weights near the top).")
+    p.add_argument("--strict-sequential", dest="strict_sequential", action="store_true",
+                   help="use the equations STRICTLY IN ORDER (no QR pivoting): the square "
+                        "solve takes the first weights' equations as listed and the detectors "
+                        "the next ones, rather than QR-selecting a well-conditioned subset.  "
+                        "Far more sensitive to the weight ORDER (an ill-conditioned leading "
+                        "block will not resolve the coefficients), so pair it with a "
+                        "deliberately ordered --weights-file.  Default: off (QR selection).")
+    p.add_argument("--save-equations", default=None, metavar="FILE",
+                   help="save the weight functions in the ORDER THEY ARE ACTUALLY USED to "
+                        "FILE (read_weight_file format, round-trippable via --weights-file).  "
+                        "Runs one representative solve at the start point to capture the "
+                        "order; with QR selection (the default, i.e. WITHOUT "
+                        "--strict-sequential) this records the order QR chose, which you can "
+                        "then replay deterministically with --weights-file FILE "
+                        "--strict-sequential.")
     p.add_argument("--append", default=None, metavar="FILE",
                    help="append the result report(s) to this file (e.g. to log a grid)")
     p.add_argument("--verbose", action="store_true",
@@ -2423,14 +2555,23 @@ def _search_cli(argv):
     # weights are redundant), unless the user forced it on/off with the flags.
     nonneg_beta = fam.self_dual if a.nonneg_beta is None else a.nonneg_beta
     root_finder = _broyden if a.cold_solver == "broyden" else _broyden_secant
+    strict_seq = a.strict_sequential
     weight_set = read_weight_file(a.weights_file) if a.weights_file else None
     if weight_set is not None:
-        print("  weights: read %d from %s (used in file order)"
-              % (len(weight_set.weights), a.weights_file))
+        print("  weights: read %d from %s (%s)"
+              % (len(weight_set.weights), a.weights_file,
+                 "strict sequential order" if strict_seq else "file order, QR-selected"))
     mp.dps = a.working_precision
     eg = mpc(complex(a.epsilon.replace(" ", "")))
     # given coefficients are KEPT; the rest randomized (n_loc components per prime)
     guess = _parse_coeffs(a.coeffs, euler.complex_unknowns_per_prime)
+
+    # --save-equations: capture the weight order actually used, from one representative solve
+    # at the start point, and write it (round-trippable via --weights-file).
+    if a.save_equations:
+        _save_used_equations(land, euler, point, a, weight_set, strict_seq,
+                             nonneg_beta, root_finder)
+
     t0 = time.time()
 
     # report each candidate's result block as soon as it finishes refining, and keep the
@@ -2453,7 +2594,7 @@ def _search_cli(argv):
         sharpen_iters=a.sharpen_iters, abandon_patience=a.abandon_after,
         explore_wp_cap=a.explore_wp, scale=mpf(a.coeff_scale),
         nonneg_beta=nonneg_beta, root_finder=root_finder,
-        weight_set=weight_set, in_order=(weight_set is not None),
+        weight_set=weight_set, in_order=(weight_set is not None), strict_seq=strict_seq,
         verbose=a.verbose, on_result=on_result)
     elapsed = time.time() - t0
 
