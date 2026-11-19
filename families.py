@@ -116,6 +116,9 @@ class Landscape:
     mu_from_point: Callable          # point -> list of Gamma_R shifts (mu), complex
     nu_from_point: Callable          # point -> list of Gamma_C shifts (nu), complex
     signature: tuple = (0, 0)        # (d1, d2)
+    sign: Optional[mpc] = None       # the sign of the functional equation when it is
+    #                                  known exactly (e.g. 1 for R0R0R0N1); None = unknown,
+    #                                  solved for as (epsR, epsI) with epsR^2 + epsI^2 = 1
 
 
 @dataclass
@@ -368,6 +371,18 @@ def _parse_blocks(text):
     return blocks
 
 
+def parse_sign(text):
+    """The registry 'sign' value: 'unknown' (default) or a number of absolute value 1,
+    such as 1, -1, or 0.6+0.8j.  Returns None for unknown, else an mpc."""
+    text = (text or "unknown").strip()
+    if text.lower() == "unknown":
+        return None
+    value = mpc(complex(text.replace(" ", "").replace("i", "j")))
+    if abs(abs(value) - 1) > mpf("1e-12"):
+        raise ValueError("sign %r does not have absolute value 1" % text)
+    return value
+
+
 def family_from_block(name, blk):
     """Build a Family from one parsed registry block."""
     degree = int(blk["degree"])
@@ -389,7 +404,8 @@ def family_from_block(name, blk):
 
     landscape = Landscape(name=blk.get("description", name), degree=degree,
                           conductor=conductor, dim=dim, mu_from_point=mu_from_point,
-                          nu_from_point=nu_from_point, signature=(d1, d2))
+                          nu_from_point=nu_from_point, signature=(d1, d2),
+                          sign=parse_sign(blk.get("sign", "unknown")))
 
     euler = euler_local(degree, character, self_dual)
 

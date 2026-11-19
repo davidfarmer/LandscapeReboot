@@ -21,6 +21,10 @@
 #                label q.n.  Fixes the good-prime top coefficient (Ax5a:
 #                F_p(z) = 1 - a_p z + ... + (-1)^d chi(p) z^d) and, with the
 #                Gamma shifts, the parity (Ax5c).
+#   sign         the sign of the functional equation, when it is known exactly:
+#                a number of absolute value 1 such as 1, -1, or 0.6+0.8j.  Default
+#                'unknown': the sign is then solved for, as epsR + i epsI with
+#                epsR^2 + epsI^2 = 1.  A known sign is not an unknown of the search.
 #   self_dual    true | false (default false).  When true the L-function is
 #                self-dual and the good-prime local factor is self-reciprocal
 #                (real coefficients, roots closed under z -> chi(p)/z),
@@ -53,6 +57,7 @@ degree      = 3
 signature   = 3, 0
 conductor   = 1
 character   = trivial
+sign        = 1
 self_dual   = false
 gamma       = R(0 | 1, 0)
 gamma       = R(0 | 0, 1)

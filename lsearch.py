@@ -37,8 +37,11 @@ Conventions fixed for the whole search (per the project design):
     the single a_p = b(p): the local factor is 1 - a_p X + conj(a_p) X^2 - X^3 with
         b(p^k) = a_p b(p^{k-1}) - conj(a_p) b(p^{k-2}) + b(p^{k-3}),   b(p^0)=1.
     The Euler algebra (families.euler_self_reciprocal) generalizes this to any degree.
-  * The sign epsilon is itself unknown, carried as (epsR, epsI) with the extra
-    equation epsR^2 + epsI^2 = 1.
+  * When the sign epsilon is not known it is an unknown, carried as (epsR, epsI)
+    with the extra equation epsR^2 + epsI^2 = 1.  When it is known exactly (the
+    landscape's `sign`, e.g. 1 for R0R0R0N1) it is NOT an unknown: the (epsR, epsI)
+    slots of the unknown vector hold the known value, no solver varies them, and the
+    normalization equation is not used.
   * Equations come from the list of weight functions (not from varying a point s);
     `coefficient_relation` is always called at the fixed symmetry point s = 1/2.
 """
@@ -253,9 +256,21 @@ def dirichlet_length(landscape, point, weights, accuracy, working_precision=None
     return M
 
 
-def count_unknowns(euler, M):
-    """Number of real unknowns: 2 (for epsilon) + (real per prime) * pi(M)."""
-    return 2 + euler.real_unknowns_per_prime * prime_pi(M)
+def count_unknowns(euler, M, sign_known=False):
+    """Number of real unknowns: 2 (for epsilon, unless the sign is known) +
+    (real per prime) * pi(M)."""
+    return (0 if sign_known else 2) + euler.real_unknowns_per_prime * prime_pi(M)
+
+
+# Pass sign=SIGN_UNKNOWN to build_equation_system to solve for the sign even when the
+# landscape knows it (sign=None means: use the landscape's sign, if any).
+SIGN_UNKNOWN = "unknown"
+
+
+def _free_columns(system, U):
+    """Indices of the unknown-vector entries the solvers may vary: all of them, or all
+    but the two sign slots (0, 1) when the sign is known."""
+    return list(range(2, U)) if system.sign is not None else list(range(U))
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +309,7 @@ class EquationSystem:
     weights: list                # the (m, alpha, beta) actually used
     solve_idx: list              # indices into the residual vector used to solve
     detector_idx: list           # indices used as detectors
-    sign: Optional[mpc] = None   # if not None, pin epsilon to this value
+    sign: Optional[mpc] = None   # known sign: epsilon is fixed at this value (not an unknown)
     in_order: bool = False       # weights are a file POOL -> take the first (needed) ones
     #                              in file order (vs. reuse/generate); see build_equation_system
     strict_seq: bool = False     # solve uses the equations strictly IN ORDER (no QR pivot)
@@ -400,6 +415,13 @@ def build_equation_system(landscape, euler, point, accuracy, working_precision=N
     supplied `weight_set` the probe is skipped entirely (M is sized from the given weights)."""
     mu = landscape.mu_from_point(point)
     nu = landscape.nu_from_point(point)
+    # the sign: None -> the landscape's (if known); SIGN_UNKNOWN -> solve for it
+    if sign is None:
+        sign = getattr(landscape, "sign", None)
+    elif isinstance(sign, str) and sign == SIGN_UNKNOWN:
+        sign = None
+    if sign is not None:
+        sign = mpc(sign)
 
     # default integration contour: out at bound + CONTOUR_MARGIN (faster grid, same
     # accuracy -- see CONTOUR_MARGIN).  At s=1/2 the f1/f2 bounds coincide.
@@ -418,7 +440,7 @@ def build_equation_system(landscape, euler, point, accuracy, working_precision=N
     worst_beta = -bmax_minus if bmax_minus > bmax_plus else bmax_plus
     M = _size_M(landscape, mu, nu, poles, worst_beta, accuracy, working_precision,
                 contour_nu, M_LIMIT)
-    need_eqs = count_unknowns(euler, M) + n_detectors
+    need_eqs = count_unknowns(euler, M, sign is not None) + n_detectors
     nW = max(28, -(-need_eqs // 2) + 8)            # weights needed: ceil(need/2) + headroom
 
     if weight_set is not None and in_order:
@@ -473,14 +495,17 @@ def build_equation_system(landscape, euler, point, accuracy, working_precision=N
     sig = {p: max(max(abs(A[i][p - 1]), abs(B[i][p - 1])) for i in range(len(A)))
            for p in primes_up_to(M)}
     primes = [p for p in primes_up_to(M) if sig[p] > unknown_tol]
-    U = 2 + euler.real_unknowns_per_prime * len(primes)
+    U = 2 + euler.real_unknowns_per_prime * len(primes)   # length of the unknown vector
 
     # residual layout: [Re E_0, Im E_0, ..., Re E_{K-1}, Im E_{K-1}, normalization]
     K = len(weights.weights)
     norm_idx = 2 * K
     detector_idx = list(range(2 * K - n_detectors, 2 * K))      # last 8 coeff reals
     solve_pool = [i for i in range(2 * K) if i not in detector_idx]
-    solve_idx = solve_pool[:U - 1] + [norm_idx]                 # U solve equations
+    if sign is None:
+        solve_idx = solve_pool[:U - 1] + [norm_idx]             # U solve equations
+    else:
+        solve_idx = solve_pool[:U - 2]                          # U-2 (sign fixed)
     return EquationSystem(landscape=landscape, euler=euler, point=point,
                           accuracy=accuracy, working_precision=working_precision or 0,
                           M=M, primes=primes, n_unknowns=U, A=A, B=B, pole=pole,
@@ -490,12 +515,15 @@ def build_equation_system(landscape, euler, point, accuracy, working_precision=N
 
 
 def residual(system, u, primes=None):
-    """Full real residual vector at unknowns u (length 2*n_weights + 1, plus a sign
-    pin if system.sign is set).  `primes` selects which primes u parametrizes
-    (default system.primes); primes not in the list have a_p = 0."""
+    """Full real residual vector at unknowns u (length 2*n_weights + 1).  `primes`
+    selects which primes u parametrizes (default system.primes); primes not in the list
+    have a_p = 0.  When the sign is known (system.sign) it is used in place of u[0], u[1],
+    and the normalization row (the last) is identically 0."""
     if primes is None:
         primes = system.primes
     epsilon, ap = unpack_unknowns(u, primes, system.euler.complex_unknowns_per_prime)
+    if system.sign is not None:
+        epsilon = system.sign
     b = system.euler.bcoeffs_from_ap(ap, system.M)
     bconj = [mpmath.conj(x) for x in b]
     out = []
@@ -506,10 +534,10 @@ def residual(system, u, primes=None):
         E += epsilon * mpmath.fsum(Bi[n] * bconj[n] for n in range(system.M))
         out.append(mpmath.re(E))
         out.append(mpmath.im(E))
-    out.append(u[0] * u[0] + u[1] * u[1] - 1)              # |epsilon|^2 = 1
-    if system.sign is not None:                            # optional: pin the sign
-        out.append(u[0] - mpmath.re(system.sign))
-        out.append(u[1] - mpmath.im(system.sign))
+    if system.sign is not None:
+        out.append(mpf(0))                                 # sign known: nothing to normalize
+    else:
+        out.append(u[0] * u[0] + u[1] * u[1] - 1)          # |epsilon|^2 = 1
     return out
 
 
@@ -572,7 +600,7 @@ def _equation_jacobian(system, x, primes, n_eq, deadline=None):
     h = mpf(10) ** (-(system.working_precision // 2 or 12))
     U = len(x)
     rows = [[mpf(0)] * U for _ in range(n_eq)]
-    for j in range(U):
+    for j in _free_columns(system, U):     # a known sign's columns stay 0
         if deadline is not None and time.time() > deadline:
             break
         xp = x[:]; xp[j] += h
@@ -584,14 +612,21 @@ def _equation_jacobian(system, x, primes, n_eq, deadline=None):
     return rows
 
 
-def _select_from_jacobian(jac_full, K, euler, k, n_detectors):
-    """Choose a well-conditioned square solve set (U-1 equations + the sign
-    normalization) and n_detectors further independent equations for k unknown primes,
-    by QR row pivoting on the columns of the full equation Jacobian belonging to those
-    primes.  Returns (solve_idx, det_idx)."""
+def _select_from_jacobian(jac_full, K, euler, k, n_detectors, sign_known=False):
+    """Choose a well-conditioned square solve set and n_detectors further independent
+    equations for k unknown primes, by QR row pivoting on the columns of the full
+    equation Jacobian belonging to the unknowns.  With an unknown sign the solve set is
+    U-1 equations + the sign normalization (U = 2 + unknowns of the primes); with a known
+    sign it is one equation per unknown of the primes.  Returns (solve_idx, det_idx)."""
     rpp = euler.real_unknowns_per_prime                    # 2 * complex unknowns / prime
+    prime_cols = [2 + rpp * j + t for j in range(k) for t in range(rpp)]
+    if sign_known:
+        n_solve = rpp * k
+        sub = [[row[c] for c in prime_cols] for row in jac_full]
+        sel = _select_rows(sub, n_solve + n_detectors)
+        return sel[:n_solve], sel[n_solve:n_solve + n_detectors]
     U = 2 + rpp * k
-    cols = [0, 1] + [2 + rpp * j + t for j in range(k) for t in range(rpp)]  # eps + k primes
+    cols = [0, 1] + prime_cols                             # eps + k primes
     sub = [[row[c] for c in cols] for row in jac_full]
     sel = _select_rows(sub, (U - 1) + n_detectors)
     solve_idx = sel[:U - 1] + [2 * K]                      # + the sign normalization
@@ -599,7 +634,7 @@ def _select_from_jacobian(jac_full, K, euler, k, n_detectors):
     return solve_idx, det_idx
 
 
-def _sequential_select(K, euler, k, n_detectors):
+def _sequential_select(K, euler, k, n_detectors, sign_known=False):
     """STRICT-sequential equation selection: take the residual rows IN ORDER, no QR pivoting.
     The square solve set is the first U-1 rows (Re/Im of the leading weights, in weight
     order) plus the sign normalization (row 2K); the detectors are the next n_detectors
@@ -608,13 +643,15 @@ def _sequential_select(K, euler, k, n_detectors):
     ill-conditioned leading block will not resolve the coefficients -- so it is opt-in
     (--strict-sequential) and expects a deliberately ordered weight file."""
     rpp = euler.real_unknowns_per_prime
-    U = 2 + rpp * k
-    if 2 * K < (U - 1) + n_detectors:       # not enough equations for solve set + detectors
-        if 2 * K < U - 1:                   # not even enough for the square solve -> stop
+    # rows of the coefficient equations used for the solve: U-1 (+ normalization) with an
+    # unknown sign, or one per prime unknown with a known sign
+    n_rows = rpp * k if sign_known else 2 + rpp * k - 1
+    if 2 * K < n_rows + n_detectors:        # not enough equations for solve set + detectors
+        if 2 * K < n_rows:                  # not even enough for the square solve -> stop
             return None
-        n_detectors = max(0, 2 * K - (U - 1))
-    solve_idx = list(range(U - 1)) + [2 * K]                 # first U-1 rows + normalization
-    det_idx = list(range(U - 1, U - 1 + n_detectors))
+        n_detectors = max(0, 2 * K - n_rows)
+    solve_idx = list(range(n_rows)) + ([] if sign_known else [2 * K])
+    det_idx = list(range(n_rows, n_rows + n_detectors))
     return solve_idx, det_idx
 
 
@@ -787,7 +824,10 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
     cand = system.primes
     if not cand:
         return None
-    if eps_guess is None:
+    sign_known = system.sign is not None
+    if sign_known:                  # a known sign is not an unknown: hold it fixed
+        eps_guess = system.sign
+    elif eps_guess is None:
         eps_guess = mpc(1)
     if tol is None:                 # the square solve set must be driven near 0
         tol = mpf(10) ** (-(system.accuracy))
@@ -823,20 +863,31 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
         if fixed is None:
             primes = cand[:k]
             if getattr(system, "strict_seq", False):    # use the equations strictly in order
-                sel = _sequential_select(K, system.euler, k, n_detectors)
+                sel = _sequential_select(K, system.euler, k, n_detectors, sign_known)
                 if sel is None:         # too few weights for this many unknowns -> stop
                     break
                 solve_idx, det_idx = sel
             else:
                 solve_idx, det_idx = _select_from_jacobian(jac_full, K, system.euler,
-                                                           k, n_detectors)
+                                                           k, n_detectors, sign_known)
         x0 = _guess_vector(primes, guess, eps_guess, nloc)
 
         def F(u, _si=solve_idx, _pr=primes):
             full = residual(system, u, primes=_pr)
             return [full[i] for i in _si]
 
-        out = root_finder(F, x0, h, tol, maxiter, deadline=deadline)
+        if sign_known:
+            # vary only the prime unknowns; the sign slots keep the known value
+            head = x0[:2]
+
+            def Fv(v, _F=F, _head=head):
+                return _F(_head + list(v))
+
+            out = root_finder(Fv, x0[2:], h, tol, maxiter, deadline=deadline)
+            if out is not None:
+                out = (head + list(out[0]), out[1])
+        else:
+            out = root_finder(F, x0, h, tol, maxiter, deadline=deadline)
         if out is None:             # Jacobian went singular at this prime count
             if verbose:
                 print(f"   k={k} primes={primes}: Broyden singular")
@@ -897,8 +948,11 @@ def solve_at_point_lsq(system, guess=None, eps_guess=None, k=None, n_eq=None,
     if k is None:
         k = len(cand)
     primes = cand[:k]
-    U = 2 + system.euler.real_unknowns_per_prime * k
-    if eps_guess is None:
+    sign_known = system.sign is not None
+    U = (0 if sign_known else 2) + system.euler.real_unknowns_per_prime * k
+    if sign_known:
+        eps_guess = system.sign
+    elif eps_guess is None:
         eps_guess = mpc(1)
     if tol is None:
         tol = mpf(10) ** (-(system.accuracy))
@@ -911,7 +965,7 @@ def solve_at_point_lsq(system, guess=None, eps_guess=None, k=None, n_eq=None,
     nloc = system.euler.complex_unknowns_per_prime
     x0 = _guess_vector(primes, guess, eps_guess, nloc)
     jac0 = _equation_jacobian(system, x0, primes, 2 * K)
-    eq_idx = _select_rows(jac0, n_eq) + [norm_idx]
+    eq_idx = _select_rows(jac0, n_eq) + ([] if sign_known else [norm_idx])
     x, nrm = _lsq_core(system, primes, eq_idx, x0, tol, maxiter, damping)
 
     eps, ap = unpack_unknowns(x, primes, nloc)
@@ -930,9 +984,12 @@ def _lsq_core(system, primes, fit_idx, x0, tol, maxiter, damping=mpf("1e-30")):
     Jacobian is computed ONCE at x0 and reused (chord / modified Gauss-Newton): each
     step solves min ||J du + F|| via QR (LM-damped normal equations as a rank-deficient
     fallback).  Returns (x, ||fit residual||)."""
-    U = len(x0)
+    cols = _free_columns(system, len(x0))   # a known sign is held fixed
+    U = len(cols)
     h = mpf(10) ** (-(system.working_precision // 2))
     x = list(x0)
+    if system.sign is not None:             # drop the (identically 0) normalization row
+        fit_idx = [i for i in fit_idx if i != 2 * len(system.A)]
 
     def Fvec(u):
         full = residual(system, u, primes=primes)
@@ -940,12 +997,12 @@ def _lsq_core(system, primes, fit_idx, x0, tol, maxiter, damping=mpf("1e-30")):
 
     # one Jacobian at x0, reused for every step
     J = [[mpf(0)] * U for _ in range(len(fit_idx))]
-    for j in range(U):
+    for c, j in enumerate(cols):
         xp = x[:]; xp[j] += h
         xm = x[:]; xm[j] -= h
         rp = Fvec(xp); rm = Fvec(xm)
         for i in range(len(fit_idx)):
-            J[i][j] = (rp[i] - rm[i]) / (2 * h)
+            J[i][c] = (rp[i] - rm[i]) / (2 * h)
     Jm = mpmath.matrix(J)
     # The Jacobian is FIXED across the (chord) Gauss-Newton steps, so factor it ONCE and
     # reuse the factorization -- qr_solve re-factors the same matrix on every step.  Skinny
@@ -977,7 +1034,8 @@ def _lsq_core(system, primes, fit_idx, x0, tol, maxiter, damping=mpf("1e-30")):
         if nrm < tol:
             break
         du = step(Fx)
-        x = [x[i] + du[i] for i in range(U)]
+        for c, j in enumerate(cols):
+            x[j] = x[j] + du[c]
     return x, nrm
 
 
@@ -1155,14 +1213,14 @@ def _solve_cond(system, primes, x, solve_idx, h):
     """Condition number of the solve subsystem (d solve-equations / d unknowns) at x;
     log10 of it is roughly the number of digits lost in recovering the coefficients."""
     r0 = [residual(system, x, primes=primes)[i] for i in solve_idx]
-    U = len(x)
-    J = [[mpf(0)] * U for _ in range(len(solve_idx))]
-    for j in range(U):
+    cols = _free_columns(system, len(x))           # a known sign is not an unknown
+    J = [[mpf(0)] * len(cols) for _ in range(len(solve_idx))]
+    for c, j in enumerate(cols):
         xp = x[:]
         xp[j] = xp[j] + h
         rp = [residual(system, xp, primes=primes)[i] for i in solve_idx]
         for i in range(len(solve_idx)):
-            J[i][j] = (rp[i] - r0[i]) / h
+            J[i][c] = (rp[i] - r0[i]) / h
     return _condition_number(J)
 
 
@@ -2089,7 +2147,8 @@ def selftest_m2(accuracy=8, working_precision=30, verbose=True):
         if verbose:
             print(f"[M2] M={system.M}, primes={len(primes)}, U={system.n_unknowns}, "
                   f"weights={len(system.A)}, equations={len(r)}")
-            print(f"     |solve idx|={len(system.solve_idx)} (=U?), "
+            print(f"     |solve idx|={len(system.solve_idx)} (= number of unknowns: U, or U-2 "
+                  f"if the sign is known: {system.sign is not None}), "
                   f"|detectors|={len(system.detector_idx)}")
             print(f"     residual at true unknowns:  max(all)={mpmath.nstr(max_all,3)}, "
                   f"max(detectors)={mpmath.nstr(max_det,3)}, |norm|={mpmath.nstr(norm_res,3)}")
@@ -2102,7 +2161,8 @@ def selftest_m2(accuracy=8, working_precision=30, verbose=True):
         J = jacobian(system, u_true)
         if len(J) != len(r):
             pass
-        Jsolve = [J[i] for i in system.solve_idx]
+        cols = _free_columns(system, len(u_true))      # a known sign is not an unknown
+        Jsolve = [[J[i][j] for j in cols] for i in system.solve_idx]
         cond = _condition_number(Jsolve)
         sc = system.scales
         if verbose:
@@ -2455,7 +2515,11 @@ def _search_cli(argv):
                    help="stop once the box half-width reaches this")
     p.add_argument("--max-iter", type=int, default=12)
     p.add_argument("--epsilon", default="1",
-                   help="sign (root number) guess, e.g. '1' or '0.6+0.8j'")
+                   help="starting guess for the sign (root number), e.g. '1' or '0.6+0.8j'; "
+                        "used only when the sign is unknown (the landscape has no 'sign', "
+                        "or --sign-unknown is given)")
+    p.add_argument("--sign-unknown", action="store_true",
+                   help="solve for the sign even if the landscape registry gives it")
     p.add_argument("--wander-dist", default="0.25",
                    help="abort if the centre drifts this far (absolute) from the start")
     p.add_argument("--timeout", type=float, default=600,
@@ -2544,6 +2608,8 @@ def _search_cli(argv):
     land, euler = fam.landscape, fam.euler
     if a.conductor is not None and a.conductor != land.conductor:
         land = dataclasses.replace(land, conductor=a.conductor)
+    if a.sign_unknown:
+        land = dataclasses.replace(land, sign=None)
     point = tuple(mpf(t.strip()) for t in a.point.split(","))
     if len(point) != land.dim:
         p.error("landscape %s has %d free spectral parameter(s); --point gave %d"
