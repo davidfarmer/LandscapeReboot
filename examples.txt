@@ -139,3 +139,20 @@ python3 lsearch.py m4
 
 -----
 
+REFINE one entry of an L-point data file by ONE box step (refine_step.py), and append
+the refined entry to an output data file (format:
+~/Research/RebootOfNothing/Data/FORMAT.md).  The box size and truncation error default
+to the entry's divided by 10, and the working precision to
+max(old, 20 + old working precision - old detector precision).  The accuracy of each new
+number is its number of decimals of agreement with the entry it refines.  A known sign
+(here 1) is held fixed.  Run from ~/Research/RebootOfNothing; entry 6 is the 7th line:
+
+python3 ~/my1/refine_step.py --data Data/R0R0R0N1.jsonl --index 6 --output Data/refined.jsonl
+
+A quick, low-accuracy try (about 20 minutes):
+
+python3 ~/my1/refine_step.py --data Data/R0R0R0N1.jsonl --index 6 --output Data/test.jsonl \
+    --box-size 1e-6 --truncation-error 1e-10 --working-precision 40
+
+-----
+
