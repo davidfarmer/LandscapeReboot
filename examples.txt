@@ -91,11 +91,68 @@ python3 lsearch.py search --point=14.141635588127451714,2.3803884888122250825 --
 
 -----
 
+SEARCH with the WEIGHT FUNCTIONS read from a file (instead of auto-generated).  The
+weights g(s)=s^m exp(i*beta*s+alpha*s^2) that build the equations can be supplied with
+--weights-file, one 'm, alpha, beta' per line (see sample_weights.txt for the syntax).
+The file is a POOL in PRIORITY ORDER and may be long: the search still probes to decide
+how many equations it needs, then takes that many weights from the TOP of the file, in
+the listed order (the square solve QR-selects a well-conditioned subset of those, so put
+a diverse mix of weights near the top).  Useful for supplying an exact weight pool or
+experimenting with hand-chosen weights.  Here it explores near (20, 6.5) with the sample
+weight pool and refines candidates toward the nearby GL(3) forms (e.g. the one near
+(20.25106, 6.57592)) -- the same behaviour as the auto-generated weights:
+
+python3 lsearch.py search --point=20,6.5 --conductor 1 \
+          --weights-file sample_weights.txt \
+          --boxsize 1e-3 --accuracy 8 --working-precision 40 \
+          --target 1e-4 --max-iter 12 --max-candidates 2
+
+-----
+
+SAVE the weights in the ORDER ACTUALLY USED, and STRICT-SEQUENTIAL replay.  By
+default the square solve QR-selects a well-conditioned subset of the equations.
+--save-equations FILE runs one representative solve at the start point and writes
+the weights in the order that solve used (QR's chosen order first, then the rest),
+in the --weights-file format.  You can then replay that exact order deterministically
+WITHOUT QR by passing the saved file back with --strict-sequential (which takes the
+listed equations strictly in order -- no pivoting).  First capture the order:
+
+python3 lsearch.py search --point=20.25106,6.57592 --conductor 1 \
+          --coeffs="-0.374+0.594j,-0.385+0.988j,0.947-0.078j,0.328+0.805j,-0.653-0.011j" \
+          --weights-file sample_weights.txt --save-equations qr_used.txt \
+          --working-precision 40 --max-iter 1 --max-candidates 1
+
+then replay it strictly in that order (no QR):
+
+python3 lsearch.py search --point=20,6.5 --conductor 1 \
+          --weights-file qr_used.txt --strict-sequential \
+          --boxsize 1e-3 --accuracy 8 --working-precision 40 \
+          --target 1e-4 --max-iter 12 --max-candidates 2
+
+-----
+
 Self-tests (fast validation that the engine and the search machinery are sound):
 
 python3 afe.py selftest --accuracy 20
 python3 lsearch.py m3
 python3 lsearch.py m4
+
+-----
+
+REFINE one entry of an L-point data file by ONE box step (refine_step.py), and append
+the refined entry to an output data file (format:
+~/Research/RebootOfNothing/Data/FORMAT.md).  The box size and truncation error default
+to the entry's divided by 10, and the working precision to
+max(old, 20 + old working precision - old detector precision).  The accuracy of each new
+number is its number of decimals of agreement with the entry it refines.  A known sign
+(here 1) is held fixed.  Run from ~/Research/RebootOfNothing; entry 6 is the 7th line:
+
+python3 ~/my1/refine_step.py --data Data/R0R0R0N1.jsonl --index 6 --output Data/refined.jsonl
+
+A quick, low-accuracy try (about 20 minutes):
+
+python3 ~/my1/refine_step.py --data Data/R0R0R0N1.jsonl --index 6 --output Data/test.jsonl \
+    --box-size 1e-6 --truncation-error 1e-10 --working-precision 40
 
 -----
 
