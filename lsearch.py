@@ -266,6 +266,45 @@ def count_unknowns(euler, M, sign_known=False):
 # landscape knows it (sign=None means: use the landscape's sign, if any).
 SIGN_UNKNOWN = "unknown"
 
+# Why the last failed call failed (a short text), for callers that report failures
+# (refine_step.py).  Set when solve_at_point returns None, when _solve_corner gives up,
+# and when box_step returns None; they do not change any return value.
+LAST_SOLVE_FAILURE = None
+LAST_CORNER_FAILURE = None
+LAST_BOX_STEP_FAILURE = None
+
+
+def _describe_solve_failure(n_cand, singular, stalled, timed_out, stopped_early, tol):
+    """One line: what happened at each prime count tried by solve_at_point."""
+    parts = []
+    if n_cand == 0:
+        return "no candidate primes"
+    if singular:
+        parts.append("Jacobian singular at k=" + _k_ranges(singular))
+    if stalled:
+        best_k, best_nrm = min(stalled, key=lambda kn: kn[1])
+        parts.append("Broyden stalled at k=%s (smallest residual %s at k=%d; tolerance %s)" % (
+            _k_ranges([k for k, _ in stalled]), mpmath.nstr(best_nrm, 2), best_k, mpmath.nstr(tol, 2)))
+    if timed_out:
+        parts.append("ran out of time")
+    if stopped_early:
+        parts.append("too few equations for more primes")
+    return "; ".join(parts) if parts else "no prime count tried"
+
+
+def _k_ranges(ks):
+    """[3,4,5,7] -> '3-5,7'"""
+    ks = sorted(ks)
+    out, start, prev = [], ks[0], ks[0]
+    for k in ks[1:] + [None]:
+        if k is not None and k == prev + 1:
+            prev = k
+            continue
+        out.append(str(start) if start == prev else "%d-%d" % (start, prev))
+        if k is not None:
+            start = prev = k
+    return ",".join(out)
+
 
 def _free_columns(system, U):
     """Indices of the unknown-vector entries the solvers may vary: all of them, or all
@@ -820,9 +859,12 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
     detector residual to the noise floor.  Pass `fixed=(solve_idx, det_idx, primes)` to
     reuse a previously chosen equation set (e.g. the same detectors at every box corner).
 
-    Returns a dict (primes, epsilon, ap, residuals, solve_idx, det_idx, ...) or None."""
+    Returns a dict (primes, epsilon, ap, residuals, solve_idx, det_idx, ...) or None
+    (then LAST_SOLVE_FAILURE says why)."""
+    global LAST_SOLVE_FAILURE
     cand = system.primes
     if not cand:
+        LAST_SOLVE_FAILURE = "no candidate primes"
         return None
     sign_known = system.sign is not None
     if sign_known:                  # a known sign is not an unknown: hold it fixed
@@ -857,14 +899,18 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
             jac_full = _equation_jacobian(system, xall, cand, 2 * K, deadline=deadline)
 
     best = None
+    singular, stalled = [], []          # (for the failure description)
+    timed_out = stopped_early = False
     for k in ks:
         if deadline is not None and time.time() > deadline:
+            timed_out = True
             break                       # out of time -> return the best found so far
         if fixed is None:
             primes = cand[:k]
             if getattr(system, "strict_seq", False):    # use the equations strictly in order
                 sel = _sequential_select(K, system.euler, k, n_detectors, sign_known)
                 if sel is None:         # too few weights for this many unknowns -> stop
+                    stopped_early = True
                     break
                 solve_idx, det_idx = sel
             else:
@@ -889,6 +935,7 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
         else:
             out = root_finder(F, x0, h, tol, maxiter, deadline=deadline)
         if out is None:             # Jacobian went singular at this prime count
+            singular.append(k)
             if verbose:
                 print(f"   k={k} primes={primes}: Broyden singular")
             # Only stop enlarging if we ALREADY have a solution at a smaller k (there the
@@ -902,6 +949,7 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
             continue
         x, nrm = out
         if nrm > tol:               # solve set didn't converge -> enlarge
+            stalled.append((k, nrm))
             if verbose:
                 print(f"   k={k} primes={primes}: solve stalled {mpmath.nstr(nrm,3)}")
             continue
@@ -923,6 +971,9 @@ def solve_at_point(system, guess=None, eps_guess=None, k_init=3, k_max=None,
             best = cand_sol
         if det < det_tol:           # detectors at the floor -> a genuine solution
             break
+    if best is None:
+        LAST_SOLVE_FAILURE = _describe_solve_failure(len(cand), singular, stalled, timed_out,
+                                                     stopped_early, tol)
     return best
 
 
@@ -1115,8 +1166,14 @@ def _solve_corner(system, guess, eps_guess, deadline, restarts, fixed=None, root
         return solve_at_point(system, guess=seed, eps_guess=eps_guess, deadline=deadline,
                               root_finder=root_finder)
 
+    global LAST_CORNER_FAILURE
     sol = solve(guess)
-    if sol is not None or restarts <= 0:
+    if sol is not None:
+        return sol
+    tries = 1
+    first_failure = LAST_SOLVE_FAILURE
+    if restarts <= 0:
+        LAST_CORNER_FAILURE = "1 try (no restarts): " + str(first_failure)
         return sol
     nloc = system.euler.complex_unknowns_per_prime
     primes = fixed[2] if fixed is not None else system.primes
@@ -1129,8 +1186,11 @@ def _solve_corner(system, guess, eps_guess, deadline, restarts, fixed=None, root
         else:                                     # keep the low primes, randomize the rest
             seed = _random_ap(primes, mpf(2), nloc, fixed=low)
         sol = solve(seed)
+        tries += 1
         if sol is not None:
             return sol
+    LAST_CORNER_FAILURE = "%d tries (the given coefficients, then %d restarts); from the given " \
+        "coefficients: %s" % (tries, tries - 1, first_failure)
     return sol
 
 
@@ -1149,6 +1209,8 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
     improve the lambda-determination (the L2 compromise muddies the held-out detector
     geometry), so it is not the default.  LSQ's real value is sharper COEFFICIENTS at a
     known point -- see search(refine_coeffs=...)."""
+    global LAST_BOX_STEP_FAILURE
+    LAST_BOX_STEP_FAILURE = None
     h = mpf(boxsize)
     corners = triangle_corners(point, h, angle)
 
@@ -1159,7 +1221,12 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
                                  in_order=in_order, strict_seq=strict_seq)
     sol0 = _solve_corner(sys0, guess, eps_guess, deadline, solve_restarts,
                          root_finder=root_finder)
-    if sol0 is None or timed_out():
+    if sol0 is None:
+        LAST_BOX_STEP_FAILURE = "corner 0 (the point itself) solve failed (M=%d, %d candidate " \
+            "primes): %s" % (sys0.M, len(sys0.primes), LAST_CORNER_FAILURE)
+        return None
+    if timed_out():
+        LAST_BOX_STEP_FAILURE = "timed out after the corner 0 solve"
         return None
     k = sol0["k"]
     weights = WeightSet(weights=sys0.weights)
@@ -1169,8 +1236,9 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
     fixed = (sol0["solve_idx"], sol0["det_idx"], sol0["primes"])
 
     systems, sols = [sys0], [sol0]
-    for c in corners[1:]:                       # continue from corner-0 solution
+    for ci, c in enumerate(corners[1:], 1):     # continue from corner-0 solution
         if timed_out():             # bail between corners so a timeout doesn't overshoot
+            LAST_BOX_STEP_FAILURE = "timed out before the corner %d solve" % ci
             return None
         sysc = build_equation_system(landscape, euler, c, accuracy, working_precision,
                                      weight_set=weights, beta_limits=beta_limits,
@@ -1178,6 +1246,8 @@ def box_step(landscape, euler, point, boxsize, accuracy, working_precision,
         solc = _solve_corner(sysc, sol0["ap"], sol0["epsilon"], deadline, solve_restarts,
                              fixed=fixed, root_finder=root_finder)
         if solc is None:            # a corner solve failed -> cannot form the geometry
+            LAST_BOX_STEP_FAILURE = "corner %d solve failed, with the corner 0 equations and " \
+                "%d primes (k=%d): %s" % (ci, len(sol0["primes"]), k, LAST_CORNER_FAILURE)
             return None
         systems.append(sysc)
         sols.append(solc)
