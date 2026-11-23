@@ -29,6 +29,22 @@ that is, the accuracy is ceil(-log10 T) digits.
 The accuracy of each new number is the number of digits after the decimal point
 on which it agrees with the old entry (numbers the old entry does not have get -1).
 The output file may be the same as the data file: the new entry is appended.
+
+If the box step fails, it is retried with 10 more digits of working precision, up to
+--max-retries times (default 6), also when --working-precision was given.  The phase limits
+(the largest usable |beta| of the weight functions) are probed again whenever the working
+precision changes: probed at a low precision they stop short, which gives poorer weights.
+The triangle of test points is rotated about the point: the first attempt by --start-angle
+(default 'random'; 'carry' continues from the entry being refined; or a number), and each
+new attempt by --box-angle-step more (default the golden angle, as lsearch.search does when
+zooming in).  The angle of each attempt is recorded, so a run can be repeated exactly by
+giving its first angle as --start-angle.
+Each attempt (search.attempts) records its working precision, phase limits, angle, and result,
+including which step failed.  If every attempt
+fails, a failure record is appended to the output file instead of a refined entry: a line
+with "status": "failed", a "message", and the working precisions tried (search.attempts).
+It has no point or coefficients; refine_step.py refuses to refine it, and convert_new.py
+skips it.
 """
 
 import argparse
@@ -36,6 +52,7 @@ import datetime
 import json
 import math
 import os
+import random
 import sys
 import time
 from decimal import Decimal, ROUND_HALF_EVEN, localcontext
@@ -132,8 +149,66 @@ def read_entry(path, index):
     with open(path) as handle:
         for i, line in enumerate(handle):
             if i == index:
-                return json.loads(line)
+                entry = json.loads(line)
+                if entry.get("status") == "failed":
+                    parent = entry["history"][-1]
+                    raise SystemExit("entry {} of {} is the record of a failed refinement ({}); refine "
+                                     "its parent instead: entry {} of {}".format(
+                                         index, path, entry["id"], parent.get("parent_index"),
+                                         parent.get("parent_file")))
+                return entry
     raise IndexError("{} has no entry {}".format(path, index))
+
+
+WP_STEP = 10      # digits added to the working precision for each retry
+BOX_ANGLE_STEP = "2.39996"   # radians; the golden angle, as in lsearch.search
+
+
+def start_angle(entry, spec, step, mpmath):
+    """The rotation of the first attempt's test points (radians), from --start-angle:
+    'random' (uniform in [0, 2 pi)), 'carry' (the last angle recorded in the entry's
+    search.attempts plus one step; 0 if it has none, as for the Mathematica entries), or a
+    number.  Returns (angle, how it was chosen)."""
+    spec = str(spec).strip().lower()
+    if spec == "random":
+        return mpmath.mpf(random.random()) * 2 * mpmath.pi, "random"
+    if spec == "carry":
+        attempts = (entry.get("search") or {}).get("attempts") or []
+        angles = [a["angle"] for a in attempts if a.get("angle") not in (None, "")]
+        if not angles:
+            return mpmath.mpf(0), "carried from the parent (no angle recorded there: 0)"
+        return mpmath.mpf(angles[-1]) + step, "carried from the parent ({} + one step)".format(angles[-1])
+    return mpmath.mpf(spec), "given"
+
+
+def failure_record(entry, args, box, trunc, accuracy, attempts, elapsed):
+    """The line written to the output file when every attempt failed: no point or
+    coefficients, "status": "failed", and what was tried."""
+    return {
+        "id": new_id(entry["id"]) + "-failed",
+        "status": "failed",
+        "landscape": entry["landscape"],
+        "lmfdb_label": entry.get("lmfdb_label"),
+        "lmfdb_dual_label": entry.get("lmfdb_dual_label"),
+        "message": "refine_step.py: the box step failed at every working precision tried ({}); "
+                   "nothing was computed.  Try a larger --working-precision or --max-retries, or a "
+                   "different --box-size.".format(", ".join(a["working_precision"] for a in attempts)),
+        "search": {
+            "box_size": fraction_text(box),
+            "truncation_error": fraction_text(trunc),
+            "accuracy_digits": str(accuracy),
+            "attempts": attempts,
+        },
+        "history": list(entry.get("history", [])) + [{
+            "parent": entry["id"],
+            "parent_file": os.path.basename(args.data),
+            "parent_index": args.index,
+            "program": "refine_step.py",
+            "date": datetime.datetime.now().isoformat(timespec="seconds"),
+            "seconds": round(elapsed, 1),
+            "command": " ".join(sys.argv),
+        }],
+    }
 
 
 def new_id(old_id):
@@ -161,6 +236,18 @@ def main(argv=None):
                         help="directory with afe.py, lsearch.py, families.py (default: the "
                              "directory of this file if lsearch.py is there, else ~/my1)")
     parser.add_argument("--landscape-file", help="landscape file instead of my1/landscapes.txt")
+    parser.add_argument("--max-retries", type=int, default=6,
+                        help="if the box step fails, retry this many times, each time with %d more "
+                             "digits of working precision (default 6)" % WP_STEP)
+    parser.add_argument("--start-angle", default="random",
+                        help="rotation (radians, about the point) of the first attempt's test points: "
+                             "'random' (default), 'carry' (continue from the entry being refined: its "
+                             "last recorded angle plus one --box-angle-step), or a number")
+    parser.add_argument("--box-angle-step", default=BOX_ANGLE_STEP,
+                        help="rotate the triangle of test points by this further angle (radians) for "
+                             "each new attempt at a higher precision, as lsearch.search does for each "
+                             "zoom iteration (default %s, the golden angle; 0: the same angle for every "
+                             "attempt)" % BOX_ANGLE_STEP)
     parser.add_argument("--restarts", type=int, default=6,
                         help="nearby restarts if a corner solve fails (default 6)")
     parser.add_argument("--no-final-solve", action="store_true",
@@ -195,7 +282,6 @@ def main(argv=None):
     # never lower the precision; raise it only when fewer than 20 digits were left
     wp_rule = int(math.ceil(max(old_wp, 20 + old_wp - old_left)))
     wp = args.working_precision if args.working_precision else wp_rule
-    wp_set_by_user = args.working_precision is not None
     mp.dps = wp
 
     point = [mpf(text_of(x)) for x in entry["point"]]
@@ -232,40 +318,91 @@ def main(argv=None):
                                  else landscape.sign) if sign_known else "unknown (solved for)"))
     say("  working precision {} digits (rule: max({}, 20 + {} - {:.2f}) = {}{})".format(
         wp, old_search["working_precision"], old_search["working_precision"], old_left, wp_rule,
-        "; set on the command line" if wp_set_by_user else ""))
+        "; set on the command line" if args.working_precision is not None else ""))
 
-    beta_limits = lsearch._beta_limits(landscape, tuple(point), accuracy, wp)
-    say("  phase limits (beta): +{} / -{}   [{:.0f} s]".format(
-        mpmath.nstr(beta_limits[0], 3), mpmath.nstr(beta_limits[1], 3), time.time() - started))
+    def probe_phase_limits(wp):
+        """The largest usable |beta| of the weight functions, probed at this working
+        precision: at a low precision the probe stops short, and the weights are poorer."""
+        t = time.time()
+        mp.dps = wp
+        limits = lsearch._beta_limits(landscape, tuple(point), accuracy, wp)
+        say("  phase limits (beta) at working precision {}: +{} / -{}   [{:.0f} s]".format(
+            wp, mpmath.nstr(limits[0], 4), mpmath.nstr(limits[1], 4), time.time() - t))
+        return limits
 
+    beta_limits = probe_phase_limits(wp)
+    probed_at = wp
+
+    # The entry is a known L-function, so a failed box step is retried at higher working
+    # precision (WP_STEP more digits each time, at most --max-retries times).  A step whose
+    # working precision is below lsearch's guard (accuracy + log10(cond) + GUARD_DIGITS) is
+    # redone once at the guard; that redo is not counted as a retry.
+    attempts = []
     bs = None
-    for attempt in range(3):
+    retries = 0
+    guard_redone = False
+    angle_step = mpf(args.box_angle_step)
+    angle0, how = start_angle(entry, args.start_angle, angle_step, mpmath)
+    angle0 = angle0 % (2 * mpmath.pi)
+    say("  test points rotated by {} radians about the point ({}); {} more for each new attempt".format(
+        mpmath.nstr(angle0, 6), how, mpmath.nstr(angle_step, 6)))
+    while True:
+        # attempt n: the triangle rotated by angle0 + n steps
+        angle = (angle0 + angle_step * len(attempts)) % (2 * mpmath.pi)
+        angle_text = mpmath.nstr(angle, 6) if angle else "0"
+        if wp != probed_at:                  # the phase limits depend on the precision
+            beta_limits = probe_phase_limits(wp)
+            probed_at = wp
+        limits_text = [mpmath.nstr(beta_limits[0], 4), mpmath.nstr(beta_limits[1], 4)]
         mp.dps = wp
         step_start = time.time()
+        if attempts:
+            say("  test points rotated by {} radians about the point".format(angle_text))
         bs = lsearch.box_step(landscape, euler, tuple(point), h, accuracy, wp,
                               guess=guess, eps_guess=eps_guess, solve_restarts=args.restarts,
-                              beta_limits=beta_limits)
+                              beta_limits=beta_limits, angle=angle)
+        seconds = round(time.time() - step_start, 1)
         if bs is None or not bs["cloud"]:
-            if wp_set_by_user or attempt == 2:
-                say("  box step failed at working precision {} [{:.0f} s]".format(wp, time.time() - step_start))
-                bs = None
+            if bs is None:
+                reason = lsearch.LAST_BOX_STEP_FAILURE or "box step failed (no reason recorded)"
+            else:
+                reason = "no cloud points: the {} detector lines gave no usable intersections".format(
+                    len(bs.get("lines") or []))
+            attempts.append({"working_precision": str(wp), "phase_limits": limits_text, "angle": angle_text,
+                             "result": "failed: " + reason, "seconds": seconds})
+            bs = None
+            say("  box step failed at working precision {} [{:.0f} s]: {}".format(wp, seconds, reason))
+            if retries >= args.max_retries:
+                say("  no retries left")
                 break
-            wp += 10
-            say("  box step failed; raising working precision to {} and retrying".format(wp))
+            retries += 1
+            wp += WP_STEP
+            say("  raising working precision to {} and retrying (retry {} of {})".format(
+                wp, retries, args.max_retries))
             continue
         need = int(math.ceil(accuracy + float(mpmath.log10(bs["cond_solve"])) + lsearch.GUARD_DIGITS))
         say("  box step done at working precision {} [{:.0f} s]: {} cloud points, solve condition {}".format(
-            wp, time.time() - step_start, len(bs["cloud"]), mpmath.nstr(bs["cond_solve"], 3)))
-        if wp >= need or wp_set_by_user or attempt == 2:
+            wp, seconds, len(bs["cloud"]), mpmath.nstr(bs["cond_solve"], 3)))
+        if wp >= need or guard_redone:
+            attempts.append({"working_precision": str(wp), "phase_limits": limits_text, "angle": angle_text,
+                             "result": "ok", "seconds": seconds})
             if wp < need:
                 say("  warning: working precision {} is below accuracy + log10(cond) + {} = {}".format(
                     wp, lsearch.GUARD_DIGITS, need))
             break
+        attempts.append({"working_precision": str(wp), "phase_limits": limits_text, "angle": angle_text,
+                         "result": "below the guard {}; redone".format(need), "seconds": seconds})
         say("  working precision {} < accuracy + log10(cond) + {} = {}; redoing at {}".format(
             wp, lsearch.GUARD_DIGITS, need, need + 3))
         wp = need + 3
+        guard_redone = True
     if bs is None:
-        print("FAILED: no solution; nothing written.", file=sys.stderr)
+        record = failure_record(entry, args, box, trunc, accuracy, attempts, time.time() - started)
+        with open(args.output, "a") as handle:
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        print("FAILED: the box step failed at working precision {}; a failure record {} was "
+              "appended to {}.".format(", ".join(a["working_precision"] for a in attempts),
+                                       record["id"], args.output), file=sys.stderr)
         return 1
 
     center, spread = lsearch.cloud_center_spread(bs["cloud"])
@@ -330,6 +467,7 @@ def main(argv=None):
             "detector_residual": mpmath.nstr(det_res, 3),
             "coefficient_fit_residual": mpmath.nstr(fit_res, 3) if fit_res is not None else None,
             "cloud_points": len(bs["cloud"]),
+            "attempts": attempts,
         },
         "source": entry.get("source"),
         "history": list(entry.get("history", [])) + [{
